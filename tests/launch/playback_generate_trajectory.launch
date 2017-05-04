@@ -1,0 +1,69 @@
+<launch>
+
+  <param name="use_sim_time" value="true" />
+
+  <arg name="bag_path"  default="$(find tests)/bags/"/>
+  <arg name="save_path" default="$(find tests)/bags/processed_data/"/>
+  <arg name="map_path"  default="$(find tests)/maps/"/>
+  <arg name="bag_name"  default="b24test3"/>   
+  <arg name="map_name"  default="b24map"/>  
+  <arg name="rosbag_rate"  default="1" />
+
+  <!-- amcl parameters -->
+  <arg name="update_min_d"        default="0.30" />
+  <arg name="recovery_alpha_slow" default="0.001" />
+  <arg name="odom_model_type"     default="diff-corrected"/>
+  <arg name="odom_alpha1"         default="0.005"/>
+  <arg name="odom_alpha2"         default="0.005"/>
+  <arg name="odom_alpha3"         default="0.010"/>
+  <arg name="odom_alpha4"         default="0.005"/>
+
+
+
+
+  <!-- Playback rosbag -->
+  <node name="player" pkg="rosbag" type="play" output="screen" args="--clock --rate=$(arg rosbag_rate) $(arg bag_path)$(arg bag_name).bag"/>
+
+  <!-- TF between the robot and the laser base -->
+  <!-- TF between the robot and the laser base -->
+  <node  name="tf_base_laser" pkg="tf" type="static_transform_publisher" args="0.08 0 0 0 0 0 /base_link /laser 1" />
+
+  <!-- Processing nodes -->
+  <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_path)$(arg map_name).yaml" />
+
+  <node name="amcl" pkg="amcl" type="amcl">
+    <rosparam command="load" file="$(arg bag_path)/initial_conditions/$(arg bag_name).yaml" />
+    <param name="update_min_d"          value="$(arg update_min_d)" />
+    <param name="recovery_alpha_slow"   value="$(arg recovery_alpha_slow)" />
+        
+    <param name="odom_model_type"   value="$(arg odom_model_type)"/>
+    <param name="odom_alpha1"       value="$(arg odom_alpha1)"/>
+    <param name="odom_alpha2"       value="$(arg odom_alpha2)"/>
+    <param name="odom_alpha3"       value="$(arg odom_alpha3)"/>
+    <param name="odom_alpha4"       value="$(arg odom_alpha4)"/>
+  </node>
+
+  <node name="amcl_trajectory" pkg="hector_trajectory_server" type="hector_trajectory_server" output="screen">
+    <param name="target_frame_name" type="string" value="/map" />
+    <param name="source_frame_name" type="string" value="/base_link" />
+    <param name="trajectory_update_rate" type="double" value="10" />
+    <param name="trajectory_publish_rate" type="double" value="1" />
+  </node>
+
+  <node name="odom_trajectory" pkg="tests" type="odom_trayectory" output="screen">
+    <rosparam command="load" file="$(arg bag_path)/initial_conditions/$(arg bag_name).yaml" />
+  </node>
+
+
+  <node name="save_data" pkg="tests" type="pickle_data" >
+    <param name="save_file_path" type="string" value="$(arg save_path)" />
+    <param name="save_file_name" type="string" value="$(arg bag_name)" />
+  </node>
+
+  <!-- Viewers -->
+  <node name="rviz" pkg="rviz" type="rviz"  args="-d $(find tests)/launch/playback_trajectory_config.rviz"/>
+  <!--
+  <node name="rss_listen" pkg="rostopic" type="echo"  output="screen" args="rss" launch-prefix="xterm -e"/> -->
+
+</launch>
+

@@ -1,0 +1,6 @@
+initial_pose_x:  3.90
+initial_pose_y: -4.12
+initial_pose_a: -2.15
+initial_cov_xx:  0.05
+initial_cov_yy:  0.05
+initial_cov_aa:  0.07

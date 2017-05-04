@@ -1,0 +1,95 @@
+#!/usr/bin/env python
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import numpy as np
+import rospy
+
+from rss.msg import RssData
+from rss.classes import ProcessedData
+from geometry_msgs.msg import PoseArray, Pose, PoseWithCovarianceStamped, PoseStamped
+import tf
+from rss.bmpviz import mapviz
+
+mpl.rc('xtick', labelsize=24) 
+mpl.rc('ytick', labelsize=24)
+mpl.rcParams.update({'font.size': 24})#30
+
+fontsize = 24
+
+
+class MapViz():
+    def __init__(self):
+        rospy.init_node('map_viz',anonymous=True)  #ROS node init        
+        tf_listener = tf.TransformListener()
+        self.wifi_pose = list()
+        self.lrf_pose  = list()
+
+        self.lrf_pose_backup  = list()
+        self.wifi_pose_backup = list()
+        map_path  = rospy.get_param('/map_path','/home/renato/catkin_ws/src/tests/maps/b3map')
+        map_lim   = rospy.get_param('map_limits',None) 
+        axis_lim = (-map_lim['y_max'],-map_lim['y_min'],map_lim['x_min'],map_lim['x_max'])
+        
+        plt.ion()
+        self.fig = plt.figure(figsize=(8,8))
+        self.ax = self.fig.add_subplot(111)
+        
+        rospy.Subscriber('mcl_pose_weighted',PoseStamped,self.callback_mcl)
+        rospy.Subscriber('amcl_pose',PoseWithCovarianceStamped,self.callback_amcl)
+    
+        bmap = mapviz(root=map_path)
+        bmap.plot(f=self.fig,ax=self.ax) #coord -y,x
+        self.h1, = plt.plot([],[],'--k')
+        self.h2, = plt.plot([],[],'g')
+        self.ax.axis(axis_lim)
+        self.ax.set_ylabel('y[m]',multialignment='center',fontsize=fontsize)
+        self.ax.set_xlabel('x[m]',multialignment='center',fontsize=fontsize)
+        self.ax.set_aspect('equal')
+        self.fig.canvas.set_window_title('B3 map')
+        plt.tight_layout(pad=0.4, w_pad=0.5, h_pad=1.0)
+
+        r = rospy.Rate(0.5)
+        while not rospy.is_shutdown():
+            self.plot_update()
+            r.sleep() #base_interval
+                
+    def plot_update(self):
+        if (len(self.lrf_pose)>0)and(len(self.wifi_pose)>0):
+            try:
+                self.h1.set_xdata(-np.asarray(self.lrf_pose)[:,1])
+                self.h1.set_ydata(np.asarray(self.lrf_pose)[:,0])
+                self.h2.set_xdata(-np.asarray(self.wifi_pose)[5:,1])
+                self.h2.set_ydata(np.asarray(self.wifi_pose)[5:,0])
+                self.fig.canvas.draw()
+                self.fig.canvas.flush_events()
+
+                self.lrf_pose_backup = self.lrf_pose
+                self.wifi_pose_backup = self.wifi_pose
+            except:
+                print('[WARN] python_viz: Reverting to backup')
+                self.lrf_pose = self.lrf_pose_backup
+                self.wifi_pose = self.wifi_pose_backup
+                
+
+        
+    def arrayfrompose(self,p):
+        if type(p) is PoseWithCovarianceStamped:
+            return np.asarray([p.pose.pose.position.x, p.pose.pose.position.y,
+                    tf.transformations.euler_from_quaternion(
+                    (0.,0.,p.pose.pose.orientation.z,p.pose.pose.orientation.w))[2]]) 
+        if type(p) is PoseStamped:
+            return np.asarray([p.pose.position.x, p.pose.position.y,
+                    tf.transformations.euler_from_quaternion(
+                    (0.,0.,p.pose.orientation.z,p.pose.orientation.w))[2]]) 
+        raise Exception
+    
+    def callback_mcl(self,pose):
+        self.wifi_pose.append(self.arrayfrompose(pose))
+
+    def callback_amcl(self,pose):
+        self.lrf_pose.append(self.arrayfrompose(pose))
+
+
+if __name__ == '__main__':
+    mapviz = MapViz()
+

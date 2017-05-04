@@ -1,0 +1,133 @@
+#!/usr/bin/env python
+#TODO: change Device to accept st as float not str
+from __future__ import print_function
+import sys
+import rospy
+from std_msgs.msg import String
+from rss.RSSImeasurement import Device
+import thread
+from rss.msg import RssData, RssDatum
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+
+class RssAcquire():
+    def __init__(self):
+        global str_out
+        str_out = ''
+
+        self.pub = rospy.Publisher('rss',RssData,queue_size=10)
+        self.iface = rospy.get_param('~iface','wlan0')   #Wlan interface
+        self.st = rospy.get_param('~st',1)            #Total sample time of a hoop
+        self.ch = rospy.get_param('~ch', [6,11]) #Channels to hop
+        
+        #RSSI device init
+        self.device = Device(iface=self.iface,sample_time=self.st,channels=self.ch)
+        #Channel Hopper init
+        self.device.chopper_start()
+        while True:                                 #wait for channel hopper
+            line = self.device.chopper_process.stdout.readline()[:-1]
+            if line == 'ready':
+                break
+        self.device.read_start()                         #reading wireless start
+
+    def listen(self):
+        eprint('Reading rss starting')
+        global str_out
+
+        while not rospy.is_shutdown():
+            try:
+              line = self.device.proc_out.readline()
+              str_out = str_out + line
+              
+            except rospy.ROSInterruptException:
+              pass
+
+    def publish(self):
+        eprint('Publishing rss starting')
+        global str_out
+        rate = 1./float(self.st)
+        r = rospy.Rate(rate)  #10Hz
+        eprint('Publising rate {} Hz'.format(rate))
+        
+        while not rospy.is_shutdown():
+            ###################################
+            #TODO: add a write lock on str_out#
+            temp = str_out                    #
+            str_out = ''                      # 
+            ###################################
+            now = rospy.get_rostime()
+            time_ns = long(now.secs*1e9+now.nsecs)
+            measurement = self.process(temp,time_ns,int(self.st*1e3))
+            self.pub.publish(measurement)
+            r.sleep()
+
+    def process(self,message,time,duration):
+        '''
+        processes message containing rss measurements into a RssData packet for publishing
+        Inputs
+        ================================================================        
+        message     string with tcpdump data
+        time        time in ns sampled at the end of the meassurement
+        duration    duration of the sampling in ms
+
+        Messages format
+        ================================================================
+        RssData:
+            uint64      time_start_ns
+            uint32      duration_ms
+            string[]    mac_address
+            int16[]     freq
+            RssDatum[]  data    
+        RssDatum
+            int8[]  rss
+        '''
+        lines = message.split('\n') #separte by lines
+        dBs, macs, freqs = list(), list(), list()
+    
+        for line in lines: 
+            fields = line.split()
+            if len(fields) == 3: #to filter empty or incomplete lines
+                dBs.append(int(fields[0])) 
+                macs.append(fields[1])
+                freqs.append(int(fields[2]))
+    
+        Mac, Freq, Rss = list(), list(), list()
+
+        for mac,freq,dB in zip(macs,freqs,dBs):
+            if not mac in Mac:
+                Mac.append(mac)
+                Rss.append([dB,])
+                Freq.append(freq)
+            else:
+                index = Mac.index(mac)
+                Rss[index].append(dB)
+    
+        #RssData message
+        m = RssData()
+        m.time_start_ns = time-long(duration*1e6)
+        m.duration_ms   = duration
+        m.mac_address   = Mac
+        m.freq          = Freq
+        
+        m.data = list()
+        for i in range(len(Mac)):
+            datum = RssDatum()
+            datum.rss = Rss[i]
+            m.data.append(datum)
+
+        return m
+
+
+
+if __name__ == '__main__':
+    rospy.init_node('rss_acquire',anonymous=True)
+    try:
+        ra = RssAcquire()
+        thread.start_new_thread(ra.publish,())      #publish str_out every st seconds
+        ra.listen()                                 #updates str_out with rss measurements
+ 
+    except rospy.ROSInterruptException:
+        eprint('Could not initialize rss node')
+

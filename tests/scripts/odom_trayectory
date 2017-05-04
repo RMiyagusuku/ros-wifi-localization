@@ -1,0 +1,96 @@
+#!/usr/bin/env python
+from __future__ import print_function
+import rospy
+import tf
+from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import PoseWithCovarianceStamped, PoseStamped
+import sys
+import numpy as np
+
+class Odom():
+    def __init__(self):
+        rospy.init_node('odom_only')
+
+        self.reset_odometry = True
+        self.x0     = rospy.get_param('~initial_pose_x',0)
+        self.y0     = rospy.get_param('~initial_pose_y',0)
+        self.a0     = rospy.get_param('~initial_pose_a',0)
+        self.parent = rospy.get_param('~parent_frame','map')    
+        self.child  = rospy.get_param('~child_frame','odom_only')
+        self.source = rospy.get_param('~source','/robot/pose')    
+        self.trajectory_publish_rate = float(rospy.get_param('~trajectory_publish_rate',0.25))
+        self.initial_frame = 'initial_frame'
+
+        #Create new path
+        self.path = Path()
+        self.path.header.frame_id = self.initial_frame #reference frame
+        self.path.header.stamp    = rospy.Time.now()
+
+        #Subscribe to odometry messages
+        rospy.Subscriber(self.source, Odometry, self.callback) 
+    
+        #Create publishers
+        self.pubT = rospy.Publisher('/odom_only/trajectory', Path, queue_size=1)
+        self.pubP = rospy.Publisher('/odom_only/pose', PoseStamped, queue_size=1)
+
+        #Create broadcaster
+        self.br   = tf.TransformBroadcaster()
+    
+        #Start publishers
+        self.publish_trajectory()         
+    
+    def callback(self,odometry):    
+        #Extract new odometry information
+        tx = float(odometry.pose.pose.position.x)
+        ty = float(odometry.pose.pose.position.y)
+        oz = float(odometry.pose.pose.orientation.z)
+        ow = float(odometry.pose.pose.orientation.w)
+        oa = tf.transformations.euler_from_quaternion((0,0,oz,ow))[2]
+
+        if self.reset_odometry:
+            #Odometry at first call is stored
+            self.tx0 = tx
+            self.ty0 = ty
+            self.oa0 = oa
+            self.reset_odometry = False 
+            
+        #Broadcast tf
+        time_now = rospy.Time.now()
+        #Initial conditions with respect to parent_frame
+        self.br.sendTransform((self.x0,self.y0,0),tf.transformations.quaternion_from_euler(0,0,self.a0-self.oa0),time_now,self.initial_frame,self.parent)
+        #rectified odometry broadcast (odometry - odometry_at_time_zero)
+        self.br.sendTransform((tx-self.tx0,ty-self.ty0,0),tf.transformations.quaternion_from_euler(0,0,oa),time_now,self.child,self.initial_frame)
+
+        #Update path
+        #populate pose msg with odometry information
+        pose = PoseStamped()    
+        pose.header.frame_id = self.child
+        pose.header.stamp    = time_now
+
+        pose.pose.position.x = tx-self.tx0
+        pose.pose.position.y = ty-self.ty0
+        pose.pose.position.z = 0
+
+        q = tf.transformations.quaternion_from_euler(0,0,oa)
+
+        pose.pose.orientation.x = 0
+        pose.pose.orientation.y = 0
+        pose.pose.orientation.z = q[2]
+        pose.pose.orientation.w = q[3]
+
+        pose.header.seq = self.path.header.seq + 1
+        self.pubP.publish(pose)
+        self.path.poses.append(pose)    #append pose to path
+
+    def publish_trajectory(self):
+        rpt = rospy.Rate(self.trajectory_publish_rate)
+        while not rospy.is_shutdown():
+            self.pubT.publish(self.path)
+            rpt.sleep()
+
+if __name__ == '__main__':
+    odom = Odom()
+    r = rospy.Rate(10)    #10Hz
+    while not rospy.is_shutdown():
+        r.sleep()
+

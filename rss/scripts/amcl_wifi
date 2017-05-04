@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+#ros libraries
+import rospy
+import tf
+#ros messages
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped, PoseWithCovarianceStamped, PoseWithCovariance
+from rss.msg import RssData
+#ros services
+from rss.srv import Localization
+#personal libraries
+from rss.localization_server import loc_server_client
+from Localization.motionmodel.odometry import Odometry as OdomModel
+
+debug=0
+verbose=1
+
+#TODO
+average_wifi=0	# refer to line 157, 1 means use the first wifi signal
+				   # 0 means else
+best=0		# refer to line 348, 1 means use most weighted wifi signal
+				   # 0 means use the weighted average signal 
+header=None
+init_particle=None
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+def posefromarray(array):	# note: array --> X, Y, Orientation (Yaw)
+    pose = Pose()
+    pose.position.x = array[0]
+    pose.position.y = array[1]
+    quat = tf.transformations.quaternion_from_euler(0,0,array[2])	#change the [X, Y, Yaw] format to Pose() format which is [[X,Y,Z],[q1,q2,q3,q4]]
+    pose.orientation.z = quat[2]	# Yaw angle has only Z and W components in quaterion format
+    pose.orientation.w = quat[3]
+    return pose
+
+def arrayfrompose(pose_array):	# PoseArray() consists of header and poses
+    tmp = [[p.position.x, p.position.y,tf.transformations.euler_from_quaternion(
+            (0.,0.,p.orientation.z,p.orientation.w))[2]] for p in pose_array.poses] 
+    return np.asarray(tmp)
+
+def resampling_wheel(pose_array,weights,nsamples=None):
+    if nsamples is None:
+        nsamples = len(pose_array.poses)
+    resampled_pose_array = PoseArray()
+    resampled_weights = list()
+    index = np.random.randint(weights.shape[0])
+    beta = 0.0
+    mw = np.max(weights)
+    for i in range(nsamples):
+        beta = beta + np.random.rand()*2*mw
+        while beta > weights[index]:
+            beta -= weights[index]
+            index = (index+1)%weights.shape[0]
+        resampled_pose_array.poses.append(pose_array.poses[index])
+        resampled_weights.append(weights[index])
+    return resampled_pose_array, np.asarray(resampled_weights)
+
+class AMCL_WIFI():
+    def __init__(self):
+        rospy.init_node('amcl_wifi',anonymous=True)  #ROS node init        
+
+        #ROS PARAMSERVER
+        self.ns = rospy.get_namespace()
+        
+        #noise variance for the odom model
+        angle_var    = rospy.get_param('~angle_var',0.01)
+        distance_var = rospy.get_param('~distance_var',0.02)
+    
+        #frames
+        self.global_frame_id = rospy.get_param('~global_frame_id','map')
+        self.odom_frame_id   = rospy.get_param('~odom_frame_id','odom')
+        self.robot_frame_id  = rospy.get_param('~robot_frame_id','base_link')
+        
+        #subscribing topics
+        rss_topic  = rospy.get_param('rss_topic',self.ns+'rss')
+
+        #publishing topics
+        best_topic          = rospy.get_param('pose_best_topic', self.ns+'mcl_pose_best')        
+        weighted_topic      = rospy.get_param('pose_weighted_avg_topic',
+                                                             self.ns+'mcl_pose_weighted')        
+        pose_topic          = rospy.get_param('posearray_topic',self.ns+'mcl_pose_array')
+        prob_mesh_topic     = rospy.get_param('prob_mesh_topic',self.ns+'mcl_sensor_update_prob')
+
+        #services
+        self.loc_srv_ns = rospy.get_param('loc_srv_ns',self.ns)
+
+        #PRIVATE PARAMS
+        #updating intervals = base_interval (*)_interval
+        #e.g. interval at which poses are published 
+        #                     = base_interval(1)*pose_interval(2) = every two seconds
+        self.current_pose    = np.asarray([0.0, 0.0, 0.0]) #pose = [x, y, oz]
+        self.odom_model = OdomModel(angle_var=angle_var,distance_var=distance_var)
+
+        base_interval  = 0.5
+        odom_interval  = 1
+        pose_interval  = 2 
+        rss_interval   = 4
+        max_interval   = np.max([odom_interval,pose_interval,rss_interval])        
+        
+        self.tf_listener = tf.TransformListener()
+        self.raw_rss = list()
+        self.particles = None
+        self.particles_time = rospy.get_rostime()
+        self.seq = 0
+        self.nsamples = 1500	#1500    
+        self.asamples = 5000	#5000
+
+        #subscribers 
+        eprint('Subscribing to '+rss_topic) #listens to rss messages
+        rospy.Subscriber(rss_topic,RssData,self.callback_rss) 
+        
+        #publishers
+        eprint('Publishing to '+prob_mesh_topic)
+        self.pub_probmesh  = rospy.Publisher(prob_mesh_topic,Float64MultiArray,queue_size=1) 
+        eprint('Publishing to '+pose_topic)
+        self.pub_posearray = rospy.Publisher(pose_topic,PoseArray,queue_size=1) 
+        eprint('Publishing to '+best_topic)
+        self.pub_posebest = rospy.Publisher(best_topic,PoseStamped,queue_size=1)         
+        eprint('Publishing to '+weighted_topic)
+        self.pub_poseweighted = rospy.Publisher(weighted_topic,PoseStamped,queue_size=1)
+
+	#TODO          
+        eprint('Publishing to /initialpose')
+        self.pub_initpose = rospy.Publisher('initialpose', PoseWithCovarianceStamped,queue_size=1)
+
+        #INIT
+        #Init current pose
+        current_time = rospy.get_rostime()+rospy.Duration(0.1)
+        self.tf_listener.waitForTransform(self.odom_frame_id,self.robot_frame_id,
+                                     current_time,rospy.Duration(1.0))
+        tmp_pose = self.tf_listener.lookupTransform(self.odom_frame_id,self.robot_frame_id,current_time)
+        next_pose = np.asarray(tmp_pose[0]) #x, y, z
+        next_orientation = tf.transformations.euler_from_quaternion(tmp_pose[1]) #ox, oy, oz
+        next_pose[2] = next_orientation[2] #replace z by oz
+        self.particles_time = current_time
+        self.current_pose = next_pose
+
+        #init particles
+        while len(self.raw_rss)<4:
+            pass    #ensure at least 4 rss samples have been obtained
+
+        rospy.sleep(4)
+        init = False
+        trial = 0
+        while (not init) and (trial < 11):    #try bootstraping 10 times
+            init = self.init_particles() #bootstrap particles       
+            trial += 1
+        if init:        
+            eprint('Bootstraping successfull, trial '+str(trial))
+        else:   
+            eprint('[WARN] All bootstraping trials failed, initializing particles at 0,0')
+
+	#TODO
+	if average_wifi:
+	    self.init_pose()	# initiate initial position based on the average
+				# coordinates of the first Wifi signal.
+
+        #MAIN LOOP
+        #Self localization at rate 1/base_interval
+        r = rospy.Rate(1/base_interval)
+        counter = 0
+        while not rospy.is_shutdown():
+            counter += 1
+            r.sleep() #base_interval
+            if not counter%odom_interval:
+                self.update_odometry()
+            if not counter%pose_interval:    
+                self.publish_pose()
+            if not counter%rss_interval:
+                self.update_sensor()
+            if counter==max_interval:
+                counter=0
+
+    #TODO
+    def init_pose(self):
+	
+	self.particles = init_particle
+        x = np.sum(self.particles[:,0])/len(self.particles)
+        y = np.sum(self.particles[:,1])/len(self.particles)
+        #proper average of angles
+        c = np.sum(np.cos(self.particles[:,2]))
+        s = np.sum(np.sin(self.particles[:,2]))
+        o = np.arctan2(s,c)
+        eprint(o*180/np.pi)
+        q = tf.transformations.quaternion_from_euler(0,0,o)
+        
+        p = PoseWithCovarianceStamped()
+	msg = PoseWithCovariance()
+        msg.pose.position.x = x
+        msg.pose.position.y = y
+        msg.pose.orientation.z = q[2]
+        msg.pose.orientation.w = q[3]
+	msg.covariance = [1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.095];
+	p.pose = msg;
+	p.header = header	#from line 242
+
+        self.pub_initpose.publish(p)
+	eprint('Initial pose establised based on average of first Wifi signal')
+	
+
+    def callback_rss(self,rss):
+        self.raw_rss.append(rss)
+        
+    def init_particles(self):
+        #self.particles = 0.1*np.random.rand(self.nsamples,3) #random init
+        rss_copy = self.raw_rss
+        
+        if debug:
+            eprint('Updating particles based on '+str(len(rss_copy))+' sensor readings')
+        
+        try:
+            #get the likelihood of each particle in self.pose_array        
+            loc = loc_server_client(rss_copy,self.asamples,ns=self.loc_srv_ns) 
+            if loc is None:
+                eprint('[WARN] Bootstraping particles failed')
+                self.particles = 0.1*np.random.rand(self.asamples,3) #random init
+                return False
+
+            eprint("Localization received")
+            #for visualizing the prob of the samples sent        
+            pose_prob = Float64MultiArray()
+            pose_prob.data = loc.prob_mesh
+            self.pub_probmesh.publish(pose_prob)
+        
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            eprint('[WARN] Bootstraping particles failed, initializing particles at 0,0')
+            self.particles = 0.1*np.random.rand(self.asamples,3) #random init
+            return False
+
+        self.particles = arrayfrompose(loc.pose_array)
+
+	#TODO	# Only for pose initialization based on first Wifi signal
+	global header
+	global init_particle
+	header = loc.pose_array.header
+	init_particle = self.particles
+
+        return True
+        
+
+    def update_odometry(self):
+        #obtain new position of particles
+        #odometry is wrt odom_frame 
+        current_time = rospy.get_rostime()+rospy.Duration(0.1)
+        self.tf_listener.waitForTransform(self.odom_frame_id,self.robot_frame_id,
+                                     current_time,rospy.Duration(1.0))
+        tmp_pose = self.tf_listener.lookupTransform(self.odom_frame_id,self.robot_frame_id,current_time)
+        next_pose = np.asarray(tmp_pose[0]) #x, y, z
+        next_orientation = tf.transformations.euler_from_quaternion(tmp_pose[1]) #ox, oy, oz
+        next_pose[2] = next_orientation[2] #replace z by oz
+
+        #update particles position using odometry model
+        if debug:
+            eprint('---------------------------------------------------------------------')
+            eprint('Dif: \t'+str(next_pose-self.current_pose))
+            eprint('Prev: \t'+str(self.particles[0,:]))
+
+        self.particles = self.odom_model.forward(self.particles,[self.current_pose,next_pose])
+
+        if debug:
+            eprint('Next: \t'+str(self.particles[0,:]))
+            
+        self.particles_time = current_time
+
+        #update current pose
+        self.current_pose = next_pose
+
+    def update_sensor(self):
+        rss_copy = self.raw_rss
+        self.raw_rss = list()
+
+        if debug:
+            eprint('Updating particles based on '+str(len(rss_copy))+' sensor readings')
+
+        try:
+            #get the likelihood of each particle in self.pose_array        
+            loc = loc_server_client(rss_copy,len(self.pose_array.poses),pose_array=self.pose_array,ns=self.loc_srv_ns) 
+            if loc is None:
+                eprint('[WARN] localization not completed')
+                return False
+
+            eprint("Localization received")
+            
+            #for visualizing the prob of the samples sent        
+            pose_prob = Float64MultiArray()
+            pose_prob.data = loc.prob_mesh
+            self.pub_probmesh.publish(pose_prob)
+        
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            return False
+
+        weights = np.asarray(loc.weights)
+        index = np.argmax(weights)
+        best_pose = PoseStamped()
+        best_pose.header = loc.pose_array.header
+        best_pose.pose   = loc.pose_array.poses[index]
+        self.pub_posebest.publish(best_pose)
+        
+        if debug:
+            eprint('Max weight '+str(np.max(weights)))
+            eprint('Avg weight '+str(np.mean(weights)))
+            eprint('Min weight '+str(np.min(weights)))
+
+        if self.asamples  > self.nsamples:
+            self.asamples = int(0.9*self.asamples)
+            self.asamples = max(self.asamples,self.nsamples)
+
+        resampled_pose_array, resampled_weights = resampling_wheel(loc.pose_array,weights,nsamples=self.asamples)
+        self.pose_array = resampled_pose_array
+        self.particles = arrayfrompose(self.pose_array)
+    
+        if verbose:
+            eprint('ASamples: '+str(self.particles.shape[0]))
+
+        x = np.sum(self.particles[:,0]*resampled_weights)/np.sum(resampled_weights)
+        y = np.sum(self.particles[:,1]*resampled_weights)/np.sum(resampled_weights)
+        #proper average of angles
+        c = np.sum(np.cos(self.particles[:,2])*resampled_weights)
+        s = np.sum(np.sin(self.particles[:,2])*resampled_weights)
+        o = np.arctan2(s,c)
+        eprint(o*180/np.pi)
+        q = tf.transformations.quaternion_from_euler(0,0,o)
+        
+        wpose = PoseStamped()
+        wpose.header = loc.pose_array.header
+        wpose.pose.position.x = x
+        wpose.pose.position.y = y
+        wpose.pose.orientation.z = q[2]
+        wpose.pose.orientation.w = q[3]
+
+	#TODO   # Pose initialization based on most weighted wifi signal or weighted average wifi signal
+	global average_wifi 
+	if not average_wifi:
+	    average_wifi = 1	# flag to limit this function only execute once
+
+            p = PoseWithCovarianceStamped()
+	    p.header = loc.pose_array.header	# from line 303
+	    msg = PoseWithCovariance()
+
+	    if best:				# for most weighted wifi signal
+		msg.pose = loc.pose_array.poses[index]	# from line 304
+	    else:				# for weighted average wifi signal
+                msg.pose.position.x = x
+                msg.pose.position.y = y
+                msg.pose.orientation.z = q[2]
+                msg.pose.orientation.w = q[3]
+	    
+	    msg.covariance = [1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.095];
+	    p.pose = msg;
+            self.pub_initpose.publish(p)
+	    
+	    if best:
+		eprint('Initial pose establised!! based on /mcl_pose_best')
+	    else:
+		eprint('Initial pose establised!! based on /mcl_pose_weight')
+
+        self.pub_poseweighted.publish(wpose)
+
+
+        if verbose:        
+            eprint('Sensor update successfull')
+
+    def publish_pose(self):
+        tmp_pose_array = PoseArray()        
+        tmp_pose_array.header.seq = self.seq
+        self.seq += 1
+        tmp_pose_array.header.frame_id  = self.global_frame_id        
+        tmp_pose_array.header.stamp     = self.particles_time        
+        tmp_pose_array.poses    = [posefromarray(x) for x in self.particles]
+        self.pose_array         = tmp_pose_array
+        self.pub_posearray.publish(self.pose_array)
+
+    def callback_r0_rss(self,rss):
+        self.raw_rss.append(rss)
+
+if __name__ == '__main__':
+    rss_co_loc = AMCL_WIFI()
+
+

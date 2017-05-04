@@ -1,0 +1,24 @@
+<launch>
+  <param name="use_sim_time" value="false" />
+  <!-- Robot driver and teleoperation node -->
+  <node name="robot" pkg="rosaria" type="RosAria" respawn="true"/>
+  <node name="teleop" pkg="turtlebot_teleop" type="turtlebot_teleop_key" output="screen" launch-prefix="xterm -e" required = "true" >
+    <remap from="teleop/cmd_vel" to="/robot/cmd_vel"/>  
+  </node>
+
+  <!-- Sensors -->
+  <!-- Range finder -->
+  <node name="laser" pkg="hokuyo_node" type="hokuyo_node" />
+
+  <!--record bag -->
+  <!--
+  
+    
+  <node name="rosbag_record_main"  pkg="rosbag" type="record" args="rosout tf robot/cmd_vel scan rss laser"/>
+  <node name="rosbag_record_video" pkg="rosbag" type="record" args="record -o ./rosbags/video.bag usb_cam/image_raw"/>
+  <node name="create_bag_init_conditions" pkg="tests" type="create_init_yaml">
+
+  -->
+
+
+</launch>

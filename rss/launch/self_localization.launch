@@ -1,0 +1,120 @@
+<launch>
+
+    <param name="use_sim_time" value="true" />
+
+    <arg name="visualization"   default="true" />
+    <arg name="rosbag_rate"     default="1" />
+    <arg name="bag_name"        default="b3test1"/>   
+    <arg name="angle_var"       default="0.08"/>
+    <arg name="distance_var"    default="0.05"/>
+    <arg name="rss_interval"    default="3" />
+
+    <arg name="joint_kl"        default="0" />
+    <arg name="joint_sgPoE"     default="0" />
+
+    <arg name="model_name"      default="gaussian" />
+    <!--
+    <arg name="likelihood_eta"  default="/home/renato/Desktop/b3map_xopt_with_correlation2.p" />
+    <arg name="likelihood_CORR" default="/home/renato/Desktop/b3map_CORR2.p" />
+    -->
+    <arg name="min_particles"   default="1500" />
+    <arg name="max_particles"   default="5000" />
+
+    <arg name="bag_path"        default="$(find tests)/bags/"/>
+    <arg name="map_path"        default="$(find tests)/maps/"/>
+    <arg name="map_name"        default="b3map"/> 
+    
+    <arg name="train_data_name" default="b3test1"/> 
+    <arg name="train_data_fuse" default="10"/>
+    <arg name="save_filepath"   default="/home/renato/Desktop/test results"/> 
+
+    <!-- map limits 
+    TODO: get infor from the map server
+    b3map limit
+    -->   
+    <arg name="map_xmin"        default="-25" /> 
+    <arg name="map_xmax"        default="55"  /> 
+    <arg name="map_ymin"        default="-60" /> 
+    <arg name="map_ymax"        default="20"  /> 
+    <arg name="map_spn"         default="50"  /> 
+    <!--b2map    
+    <arg name="map_xmin" default="-20" /> 
+    <arg name="map_xmax" default="65"  /> 
+    <arg name="map_ymin" default="-25" /> 
+    <arg name="map_ymax" default="50"  /> 
+    <arg name="map_spn"  default="50"  /> 
+
+    b2
+    <arg name="map_xmin" default="-15" /> 
+    <arg name="map_xmax" default="60"  /> 
+    <arg name="map_ymin" default="-25" /> 
+    <arg name="map_ymax" default="50"  /> 
+    <arg name="map_spn"  default="50"  /> 
+
+    -->   
+
+    <!-- Playback rosbag -->
+    <node name="player" pkg="rosbag" type="play" args="--clock --rate=$(arg rosbag_rate) $(arg bag_path)$(arg bag_name).bag"/>
+
+    <!-- TF between the robot and the laser base -->
+    <node  name="tf_static" pkg="tf" type="static_transform_publisher" args="0.08 0 0 0 0 0 /base_link /laser 1" />
+
+    <!-- Processing nodes -->
+    <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_path)$(arg map_name).yaml" />
+
+    <node name="amcl" pkg="amcl" type="amcl">
+        <rosparam command="load" file="$(arg bag_path)/initial_conditions/$(arg bag_name).yaml" />
+    </node>
+
+    <node name="rss_loc_server" pkg="rss" type="localization">
+        <param name="model_name"        value="$(arg model_name)" />
+        <!--<param name="likelihood_eta"    value="$(arg likelihood_eta)" />
+        <param name="likelihood_CORR"   value="$(arg likelihood_CORR)" />-->
+        <param name="train_data_name"   value="$(arg train_data_name)" />
+        <param name="train_data_fuse"   value="$(arg train_data_fuse)" />
+        <param name="map_xmin"          value="$(arg map_xmin)" />
+        <param name="map_xmax"          value="$(arg map_xmax)" />
+        <param name="map_ymin"          value="$(arg map_ymin)" />
+        <param name="map_ymax"          value="$(arg map_ymax)" />
+        <param name="map_spn"           value="$(arg map_spn)" />
+        <param name="joint_kl"          value="$(arg joint_kl)" />
+        <param name="joint_sgPoE"       value="$(arg joint_sgPoE)" />
+
+    </node>
+
+    <node name="mcl" pkg="rss" type="mcl" respawn="true" >
+        <param name="angle_var"         value="$(arg angle_var)" />
+        <param name="distance_var"      value="$(arg distance_var)" />
+        <param name="rss_interval"      value="$(arg rss_interval)" />
+        <param name="min_particles"     value="$(arg min_particles)" />
+        <param name="max_particles"     value="$(arg max_particles)" />
+    </node>
+
+    <!-- Viewers -->
+    <group if="$(arg visualization)">
+        <node name="rss_cost_map" pkg="rss" type="costmap">
+            <param name="subs_topic_id" value="mcl_sensor_update_prob" />
+        </node>
+        <node name="rviz" pkg="rviz" type="rviz"  args="-d $(find rss)/launch/localization.rviz"/>
+    </group>
+
+    <!-- Once this node ends, all ends-->
+    <node name="save" pkg="rss" type="save" required = "true" > 
+        <param name="angle_var"         value="$(arg angle_var)" />
+        <param name="distance_var"      value="$(arg distance_var)" />
+        <param name="rss_interval"      value="$(arg rss_interval)" />
+        <param name="model_name"        value="$(arg model_name)" />
+        <param name="bag_name"          value="$(arg bag_name)" />   
+        <param name="min_particles"     value="$(arg min_particles)" />
+        <param name="max_particles"     value="$(arg max_particles)" />
+        <param name="train_data_name"   value="$(arg train_data_name)" />
+        <param name="train_data_fuse"   value="$(arg train_data_fuse)" />
+        <param name="filepath"          value="$(arg save_filepath)" />
+        <param name="joint_pgPoE"       value="$(arg joint_kl)" />
+        <param name="joint_sgPoE"       value="$(arg joint_sgPoE)" />
+
+    </node>
+</launch>
+
+
+

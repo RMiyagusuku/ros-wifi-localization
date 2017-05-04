@@ -1,0 +1,24 @@
+<launch>
+  <param name="use_sim_time" value="true" />
+
+  <arg name="bag_path"  default="$(find tests)/bags/"/>
+  <arg name="bag_name"  default="b24test1"/>   
+  <arg name="rosbag_rate"  default="1" />
+
+  <!-- Playback rosbag -->
+  <node name="player" pkg="rosbag" type="play" output="screen" args="--clock --rate=$(arg rosbag_rate) $(arg bag_path)$(arg bag_name).bag"/>
+
+  <!-- TF between the robot and the laser base -->
+  <node  name="tf_static" pkg="tf" type="static_transform_publisher" args="0.08 0 0 0 0 0 /base_link /laser 1" />
+
+  <!-- Processing nodes -->
+  <node name="slam" pkg="gmapping" type="slam_gmapping" output="screen">
+    <param name="_particles" value="200" />
+    <param name="_resampleThreshold" value="0.75"/>
+  </node>  
+
+  <!-- Viewers -->
+  <node name="rviz" pkg="rviz" type="rviz"  args="-d /home/renato/catkin_ws/src/tests/launch/testconfig.rviz"/>
+
+</launch>
+

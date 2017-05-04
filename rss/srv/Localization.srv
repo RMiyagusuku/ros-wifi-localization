@@ -1,0 +1,16 @@
+# Request for localization using wireless signal strength
+# rss and nsamples are required
+# pose_array can be an empty PoseArray
+# If pose_array is empty, the reply is a pose_array of nsamples sampled from the sensor model and its corresponding weights
+# if pose_array size equals nsamples, the sent pose_array is used to compute the weights
+# prob_mesh sends the probability at a uniform mesh. Useful for visualization. Mesh limits are in the server parameter under loc_server/params 
+
+RssData[] rss
+int64 nsamples
+geometry_msgs/PoseArray pose_array 
+
+---
+
+geometry_msgs/PoseArray pose_array
+float64[] weights
+float64[] prob_mesh

@@ -1,0 +1,8 @@
+For new datasets
+1. roslaunch playback_generate_map.launch
+2. roslaunch playback_generate_trayectory.launch
+
+[1] Uses gmapping to create a new map. At the end use 
+    rosrun map_server map_saver
+[2] Saves the variables using pickle so localization algorithm can use it. Slam implementations, obviously, do not need these pickled files. To save run
+    rostopic pub -1 /save std_msgs/String h    

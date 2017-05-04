@@ -1,0 +1,214 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+import time
+import copy
+import rospy
+import pickle
+
+#ros messages
+from std_msgs.msg import Float64MultiArray
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseArray, Pose
+from rss.msg import RssData, ProbArray
+
+
+#Services
+from rss.srv import Localization
+from rss.localization_server import loc_server_handle, loc_server_client
+
+#personal libraries
+from rss.classes import Measurement
+from rss.classes import ProcessedData
+from rss.load import load_data, load_model   
+
+from Localization.sensormodel.gp import GP
+from Localization.sensormodel.hybrid import hGP
+#from Localization.sensormodel.poe_likelihood import PoE_Gaussian
+from Localization.sensormodel.moe_likelihood import MoE_Gaussian as PoE_Gaussian
+
+
+from util.others import mesh
+
+self_localization = False
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+
+class RssLocalization():
+    def __init__(self):
+      
+        rospy.init_node('rss_localization',anonymous=True)  #ROS node init        
+        self.ns = rospy.get_namespace()
+        model_name      = rospy.get_param('~model_name','hybrid') 
+        likelihood_eta  = rospy.get_param('~likelihood_eta',False) 
+        likelihood_CORR = rospy.get_param('~likelihood_CORR',None) 
+        train_data_name = rospy.get_param('~train_data_name','b3test1')
+        train_data_fuse = rospy.get_param('~train_data_fuse',10)
+        #joint likelihood kwargs
+        kl_flag         = bool(rospy.get_param('~joint_kl',0))
+        gPoEsign        = bool(rospy.get_param('~joint_sgPoE',0))
+
+
+        #map limits 
+        self.x_min      = rospy.get_param('~map_xmin',-25)
+        self.x_max      = rospy.get_param('~map_xmax', 55)
+        self.y_min      = rospy.get_param('~map_ymin',-60)
+        self.y_max      = rospy.get_param('~map_ymax', 20)
+        self.spn        = rospy.get_param('~map_spn' , 50)
+
+        if model_name == 'hybrid':
+            WifiGP = hGP
+        else:
+            WifiGP = GP
+
+        self.seq = 0
+        self.nsamples = int(500)
+        self.load_model_flag = False
+
+        #write to param server
+        rospy.set_param('map_limits',{'x_min':self.x_min,'x_max':self.x_max,'y_min':self.y_min,
+                        'y_max':self.y_max,'spn':self.spn})
+
+
+        self.prob_array = ProbArray()
+        self.prob_array.params = [self.x_min,self.x_max,self.y_min,self.y_max,self.spn,self.spn]
+
+        #creating XY mesh
+        temp_x      = np.linspace(self.x_min,self.x_max,self.spn)
+        temp_y      = np.linspace(self.y_min,self.y_max,self.spn)
+        self.Xtest  = mesh(temp_x,temp_y)
+        
+        #Var initialization
+        self.raw_rss    = list()
+
+        #subscribers 
+        eprint('Subscribing to '+self.ns+'rss')
+        rospy.Subscriber(self.ns+'rss',RssData,self.callback_rss) 
+
+        #publishers
+        self.pub_self_pose = rospy.Publisher('self_pose',PoseArray,queue_size=1) 
+        self.pub_pose_prob = rospy.Publisher('self_pose_array',Float64MultiArray,queue_size=1)        
+
+        #Load model data or model
+        #TODO: file name as system input
+        if self.load_model_flag:
+            # Load model
+            data_empty = {'X':np.asarray([[1,1]]),'Y':np.asarray([1]),'Var':np.asarray([1])}
+            self.model = WifiGP(data_empty,verbose=True)
+            self.model.load(filepath='/home/renato/catkin_ws/src/tests/bags/processed_data/b3_hgp.p')
+
+        else:
+            file_name = train_data_name  
+            #TODO: file_path = search for test      
+            eprint('Loading model data')
+            raw_rss,poses,tmp_odom = load_data(file_name=file_name) #odometry is not needed
+            traindata = ProcessedData(raw_rss,poses=poses,
+                                      filter_fuse_measurements=train_data_fuse)
+            distance = np.sum(traindata.data['X'][1:]**2+traindata.data['X'][:-1]**2
+                -2*traindata.data['X'][1:]*traindata.data['X'][:-1],axis=1)**.5
+            avg_distance = np.mean(distance)
+
+            eprint('Number of measurements:        \t: ', traindata.nm)
+            eprint('Number of macs considered (all)\t: ', traindata.data['Y'].shape[1])
+            eprint('Average distance between points\t: ', np.round(avg_distance,2))        
+
+            #Train model
+            eprint('Training model')
+            self.model = WifiGP(traindata.data,all_mac_dict=traindata.all_mac_dict)
+            if kl_flag:
+                self.model.likelihood = PoE_Gaussian(kl_flag=kl_flag,gPoEsign=gPoEsign)
+
+
+            self.model.optimize()
+            eprint('Model trained successfully')
+
+            if likelihood_eta is not False:
+                eprint('trying to load eta')
+                eta = pickle.load(open(likelihood_eta,"rb"))
+                eprint(eta)
+                eprint('trying to load CORR')
+                CORR = pickle.load(open(likelihood_CORR,"rb"))
+                eprint(CORR)
+                self.model.likelihood.use_gate_corr = True
+                self.model.likelihood.CORR = CORR
+                self.model.likelihood.eta = eta
+        
+    
+        self.loc_server = rospy.Service(self.ns+'loc_server', Localization, self.handle_loc)
+
+        #Self localization at rate 1
+        r = rospy.Rate(1)  #1Hz
+        while not rospy.is_shutdown():
+            r.sleep()
+            #self_localize
+            if self_localization:
+                if len(self.raw_rss)>=2:
+                    self.self_loc()    
+                
+    #localization functions
+    def callback_rss(self,new_rss):
+        self.raw_rss.append(new_rss)
+      
+    def self_loc(self):
+        rss_copy = self.raw_rss
+        self.raw_rss = list()
+
+        # Visualization of posterior distribution
+        if isinstance(rss_copy,list):
+            rss_list = rss_copy 
+        else:
+            rss_list = (rss_copy,)       
+
+        try: 
+            # Option 1: accessing the service handle directly
+            # empty_pose_array = PoseArray()
+            # loc = loc_server_handle(self.model,rss_list,self.nsamples,empty_pose_array,
+            #                          ns = self.ns)
+            #nposes = len(loc[0].poses)
+            #if nposes > 1:
+            #    self.pub_self_pose.publish(loc[0])
+            
+            # Option 2: using a client to access the service            
+            loc = loc_server_client(rss_list,self.nsamples,ns=self.ns)
+            if loc is None:
+                return False
+        
+            nposes = len(loc.pose_array.poses)
+        
+            if nposes > 1:
+                self.pub_self_pose.publish(loc.pose_array)
+
+            pose_prob = Float64MultiArray()
+            pose_prob.data = loc.prob_mesh
+            self.pub_pose_prob.publish(pose_prob)
+
+
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            return False
+    
+    def handle_loc(self,req):
+        try:
+            loc = loc_server_handle(self.model,req.rss,req.nsamples,req.pose_array,ns=self.ns)
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            return None
+
+        loc[0].header.frame_id = self.ns+'map'
+        loc[0].header.seq = self.seq 
+        self.seq += 1
+
+        return loc
+
+if __name__ == '__main__':
+    rss_loc = RssLocalization()
+
+
+
+    

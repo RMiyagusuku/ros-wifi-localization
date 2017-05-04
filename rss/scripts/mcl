@@ -1,0 +1,334 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+#ros libraries
+import rospy
+import tf
+#ros messages
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped
+from rss.msg import RssData
+#ros services
+from rss.srv import Localization
+#personal libraries
+from rss.localization_server import loc_server_client
+from Localization.motionmodel.odometry import Odometry as OdomModel
+
+debug=0
+verbose=0
+random_init=0
+
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+def posefromarray(array):
+    pose = Pose()
+    pose.position.x = array[0]
+    pose.position.y = array[1]
+    quat = tf.transformations.quaternion_from_euler(0,0,array[2]) 
+    pose.orientation.z = quat[2]
+    pose.orientation.w = quat[3]
+    return pose
+
+def arrayfrompose(pose_array):
+    tmp = [[p.position.x, p.position.y,tf.transformations.euler_from_quaternion(
+            (0.,0.,p.orientation.z,p.orientation.w))[2]] for p in pose_array.poses] 
+    return np.asarray(tmp)
+
+def resampling_wheel(pose_array,weights,nsamples=None):
+    if nsamples is None:
+        nsamples = len(pose_array.poses)
+    resampled_pose_array = PoseArray()
+    resampled_weights = list()
+    index = np.random.randint(weights.shape[0])
+    beta = 0.0
+    mw = np.max(weights)
+    for i in range(nsamples):
+        beta = beta + np.random.rand()*2*mw
+        while beta > weights[index]:
+            beta -= weights[index]
+            index = (index+1)%weights.shape[0]
+        resampled_pose_array.poses.append(pose_array.poses[index])
+        resampled_weights.append(weights[index])
+    return resampled_pose_array, np.asarray(resampled_weights)
+
+class MCL():
+    def __init__(self):
+        rospy.init_node('odometry_model',anonymous=True)  #ROS node init        
+
+        #ROS PARAMSERVER
+        self.ns = rospy.get_namespace()
+        
+        #noise variance for the odom model
+        angle_var     = rospy.get_param('~angle_var',0.01)
+        distance_var  = rospy.get_param('~distance_var',0.02)
+        min_particles = rospy.get_param('~min_particles',1500)
+        max_particles = rospy.get_param('~max_particles',5000)
+        #updating intervals = base_interval (*)_interval
+        #e.g. interval at which rss is updated = base_interval(1)*rss_interval(4) = every 4 seconds
+
+        base_interval  = 1
+        odom_interval  = 1
+        pose_interval  = 1 
+        rss_interval   = rospy.get_param('~rss_interval',4)
+        max_interval   = np.max([odom_interval,pose_interval,rss_interval])        
+
+
+        #frames
+        self.global_frame_id = rospy.get_param('~global_frame_id','map')
+        self.odom_frame_id   = rospy.get_param('~odom_frame_id','odom')
+        self.robot_frame_id  = rospy.get_param('~robot_frame_id','base_link')
+        
+        #subscribing topics
+        rss_topic  = rospy.get_param('rss_topic',self.ns+'rss')
+
+        #publishing topics
+        best_topic          = rospy.get_param('pose_best_topic', self.ns+'mcl_pose_best')        
+        weighted_topic      = rospy.get_param('pose_weighted_avg_topic',
+                                                             self.ns+'mcl_pose_weighted')        
+        pose_topic          = rospy.get_param('posearray_topic',self.ns+'mcl_pose_array')
+        prob_mesh_topic     = rospy.get_param('prob_mesh_topic',self.ns+'mcl_sensor_update_prob')
+        
+        #services
+        self.loc_srv_ns = rospy.get_param('loc_srv_ns',self.ns)
+
+        #PRIVATE PARAMS
+        self.current_pose    = np.asarray([0.0, 0.0, 0.0]) #pose = [x, y, oz]
+        self.odom_model = OdomModel(angle_var=angle_var,distance_var=distance_var)
+        
+        self.tf_listener = tf.TransformListener()
+        self.raw_rss = list()
+        self.particles = None
+        self.particles_weights = None
+        self.particles_time = rospy.get_rostime()
+        self.seq = 0
+        self.nsamples = min_particles
+        self.asamples = max_particles
+
+        #subscribers 
+        eprint('Subscribing to '+rss_topic) #listens to rss messages
+        rospy.Subscriber(rss_topic,RssData,self.callback_rss) 
+        
+        #publishers
+        eprint('Publishing to '+prob_mesh_topic)
+        self.pub_probmesh  = rospy.Publisher(prob_mesh_topic,Float64MultiArray,queue_size=1) 
+        eprint('Publishing to '+pose_topic)
+        self.pub_posearray = rospy.Publisher(pose_topic,PoseArray,queue_size=1) 
+        eprint('Publishing to '+best_topic)
+        self.pub_posebest = rospy.Publisher(best_topic,PoseStamped,queue_size=1)         
+        eprint('Publishing to '+weighted_topic)
+        self.pub_poseweighted = rospy.Publisher(weighted_topic,PoseStamped,queue_size=1) 
+
+        #INIT
+        #Init current pose
+        current_time = rospy.get_rostime()+rospy.Duration(0.2)#TODO: check
+        self.tf_listener.waitForTransform(self.odom_frame_id,self.robot_frame_id,
+                                     current_time,rospy.Duration(2.0))
+        tmp_pose = self.tf_listener.lookupTransform(self.odom_frame_id,self.robot_frame_id,current_time)
+        next_pose = np.asarray(tmp_pose[0]) #x, y, z
+        next_orientation = tf.transformations.euler_from_quaternion(tmp_pose[1]) #ox, oy, oz
+        next_pose[2] = next_orientation[2] #replace z by oz
+        self.particles_time = current_time
+        self.current_pose = next_pose
+
+        #init particles
+        while len(self.raw_rss)<4:
+            pass    #ensure at least 4 rss samples have been obtained
+        
+        if random_init:
+            self.particles = np.random.rand(self.asamples,3)*80 #random init
+            self.particles[:,0] -= 25  #random init
+            self.particles[:,1] -= 60   #random init
+            #all sampled particles have orientation zero
+            #randomize theta
+            self.particles[:,2] = 2*np.pi*np.random.rand(self.asamples)-np.pi
+            self.particles_weights = np.ones(self.asamples)
+
+        else:
+            init = False
+            trial = 0
+            while (not init) and (trial <= 10):    #try bootstraping 5 times
+                init = self.init_particles() #bootstrap particles       
+                trial += 1
+            if init:        
+                eprint('Bootstraping successfull, trial '+str(trial))
+            else:   
+                eprint('[WARN] All bootstraping trials failed, initializing particles at 0,0')
+
+        #MAIN LOOP
+        #Self localization at rate 1/base_interval
+        r = rospy.Rate(1/base_interval)
+        counter = 0
+        while not rospy.is_shutdown():
+            counter += 1
+            r.sleep() #base_interval
+            if not counter%odom_interval:
+                self.update_odometry()
+            if not counter%pose_interval:    
+                self.publish_pose()
+            if not counter%rss_interval:
+                self.update_sensor()
+            if counter==max_interval:
+                counter=0
+
+    def callback_rss(self,rss):
+        self.raw_rss.append(rss)
+        
+    def init_particles(self):
+        #self.particles = 0.1*np.random.rand(self.nsamples,3) #random init
+        rss_copy = self.raw_rss
+        
+        if debug:
+            eprint('Updating particles based on '+str(len(rss_copy))+' sensor readings')
+        
+        try:
+            #get the likelihood of each particle in self.pose_array        
+            loc = loc_server_client(rss_copy,self.asamples,ns=self.loc_srv_ns) 
+            if loc is None:
+                eprint('[WARN] Bootstraping particles failed')
+                self.particles = 0.1*np.random.rand(self.asamples,3) #random init
+                self.particles_weights = np.ones(self.asamples) 
+                return False
+
+            if debug:
+                eprint("Localization received")
+            #for visualizing the prob of the samples sent        
+            pose_prob = Float64MultiArray()
+            pose_prob.data = loc.prob_mesh
+            self.pub_probmesh.publish(pose_prob)
+        
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            eprint('[WARN] Bootstraping particles failed, initializing particles at 0,0')
+            self.particles = 0.1*np.random.rand(self.asamples,3) #random init
+            self.particles_weights = np.ones(self.asamples) 
+            return False
+        self.particles = arrayfrompose(loc.pose_array)
+        #all sampled particles have orientation zero
+        #randomize theta
+        self.particles[:,2] = 2*np.pi*np.random.rand(self.asamples)-np.pi
+        self.particles_weights = np.ones(self.asamples) 
+        return True
+        
+
+    def update_odometry(self):
+        #obtain new position of particles
+        #odometry is wrt odom_frame 
+        current_time = rospy.get_rostime()
+        self.tf_listener.waitForTransform(self.odom_frame_id,self.robot_frame_id,
+                                     current_time,rospy.Duration(1.0))
+        tmp_pose = self.tf_listener.lookupTransform(self.odom_frame_id,self.robot_frame_id,current_time)
+        next_pose = np.asarray(tmp_pose[0]) #x, y, z
+        next_orientation = tf.transformations.euler_from_quaternion(tmp_pose[1]) #ox, oy, oz
+        next_pose[2] = next_orientation[2] #replace z by oz
+
+        #update particles position using odometry model
+        if debug:
+            eprint('---------------------------------------------------------------------')
+            eprint('Dif: \t'+str(next_pose-self.current_pose))
+            eprint('Prev: \t'+str(self.particles[0,:]))
+        self.particles = self.odom_model.forward(self.particles,[self.current_pose,next_pose])
+        if debug:
+            eprint('Next: \t'+str(self.particles[0,:]))
+            
+        self.particles_time = current_time
+
+        #update current pose
+        self.current_pose = next_pose
+
+    def update_sensor(self):
+        rss_copy = self.raw_rss
+        self.raw_rss = list()
+
+        if debug:
+            eprint('Updating particles based on '+str(len(rss_copy))+' sensor readings')
+
+        try:
+            #get the likelihood of each particle in self.pose_array        
+            loc = loc_server_client(rss_copy,len(self.pose_array.poses),pose_array=self.pose_array,ns=self.loc_srv_ns) 
+            if loc is None:
+                eprint('[WARN] localization not completed')
+                return False
+
+            if debug:
+                eprint("Localization received")
+            
+            #for visualizing the prob of the samples sent        
+            pose_prob = Float64MultiArray()
+            pose_prob.data = loc.prob_mesh
+            self.pub_probmesh.publish(pose_prob)
+        
+        except:
+            e = sys.exc_info()[0]
+            eprint('[ERROR] Localization failed: '+str(e))  
+            return False
+
+        weights = np.asarray(loc.weights)
+        index = np.argmax(weights)
+        best_pose = PoseStamped()
+        best_pose.header = loc.pose_array.header
+        best_pose.pose   = loc.pose_array.poses[index]
+        self.pub_posebest.publish(best_pose)
+        
+        if debug:
+            eprint('Max weight '+str(np.max(weights)))
+            eprint('Avg weight '+str(np.mean(weights)))
+            eprint('Min weight '+str(np.min(weights)))
+
+        if self.asamples  > self.nsamples:
+            self.asamples = int(0.9*self.asamples)
+            self.asamples = max(self.asamples,self.nsamples)
+
+        resampled_pose_array, resampled_weights = resampling_wheel(loc.pose_array,weights,nsamples=self.asamples)
+        self.pose_array = resampled_pose_array
+        self.particles = arrayfrompose(self.pose_array)
+        self.particles_weights = resampled_weights 
+    
+        if verbose:
+            eprint('ASamples: '+str(self.particles.shape[0]))
+
+        if verbose:        
+            eprint('Sensor update successfull')
+
+    def publish_pose(self):
+        #particles pose
+        tmp_pose_array = PoseArray()        
+        tmp_pose_array.header.seq = self.seq
+        self.seq += 1
+        tmp_pose_array.header.frame_id  = self.global_frame_id        
+        tmp_pose_array.header.stamp     = self.particles_time        
+        tmp_pose_array.poses    = [posefromarray(x) for x in self.particles]
+        self.pose_array         = tmp_pose_array
+        self.pub_posearray.publish(self.pose_array)
+
+        #weighted average
+        resampled_weights = self.particles_weights 
+        x = np.sum(self.particles[:,0]*resampled_weights)/np.sum(resampled_weights)
+        y = np.sum(self.particles[:,1]*resampled_weights)/np.sum(resampled_weights)
+        #proper average of angles
+        c = np.sum(np.cos(self.particles[:,2])*resampled_weights)
+        s = np.sum(np.sin(self.particles[:,2])*resampled_weights)
+        o = np.arctan2(s,c)
+        #eprint(o*180/np.pi)
+        q = tf.transformations.quaternion_from_euler(0,0,o)
+        
+        wpose = PoseStamped()
+        wpose.header = tmp_pose_array.header
+        wpose.pose.position.x = x
+        wpose.pose.position.y = y
+        wpose.pose.orientation.z = q[2]
+        wpose.pose.orientation.w = q[3]
+        self.pub_poseweighted.publish(wpose)
+
+
+    def callback_r0_rss(self,rss):
+        self.raw_rss.append(rss)
+
+if __name__ == '__main__':
+    mcl = MCL()
+
+

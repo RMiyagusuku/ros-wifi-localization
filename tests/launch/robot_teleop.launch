@@ -1,0 +1,8 @@
+<launch>
+  <param name="use_sim_time" value="true" />
+  <!-- Robot driver and teleoperation node -->
+  <node name="robot" pkg="rosaria" type="RosAria" respawn="true" />
+  <node name="teleop" pkg="turtlebot_teleop" type="turtlebot_teleop_key" output="screen" launch-prefix="xterm -e" required = "true" >
+    <remap from="teleop/cmd_vel" to="/robot/cmd_vel"/>  
+  </node>
+</launch>

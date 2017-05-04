@@ -1,0 +1,161 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+import time
+import copy
+import rospy
+
+#ros messages
+from std_msgs.msg import String
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseArray, Pose
+from rss.msg import RssData
+
+#Services
+from rss.srv import Localization
+from rss.localization_server import loc_server_handle
+
+#personal libraries
+from rss.classes import Measurement
+from rss.classes import ProcessedData
+
+#from Localization.sensormodel.hybrid import hGP as WifiGP
+from Localization.sensormodel.gp import GP as WifiGP
+
+from util.others import mesh
+
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+class RssLocalization():
+    def __init__(self):
+
+        rospy.init_node('rss_slam',anonymous=True)  #ROS node init        
+        self.ns = rospy.get_namespace()
+        self.seq = 0
+
+        #map limits
+        self.x_min = -25
+        self.x_max =  55
+        self.y_min = -60
+        self.y_max =  20
+        self.spn   =  50
+
+        #Writing to param server
+        rospy.set_param('map_limits',{'x_min':self.x_min,'x_max':self.x_max,'y_min':self.y_min,
+                        'y_max':self.y_max,'spn':self.spn})
+
+        #creating XY mesh
+        temp_x      = np.linspace(self.x_min,self.x_max,self.spn)
+        temp_y      = np.linspace(self.y_min,self.y_max,self.spn)
+        self.Xtest  = mesh(temp_x,temp_y)
+   
+        #Var initialization
+        self.raw_rss    = list()
+        self.poses      = None
+      
+        self.traindata  = None
+        self.model      = None
+
+        #subscribers: RssData and Path
+        self.subscribers()
+    
+        #Service provided
+        self.loc_server = rospy.Service(self.ns+'loc_server', Localization, self.handle_loc)
+
+        #New model every 2s
+        r = rospy.Rate(0.5)  #0.5Hz
+        while not rospy.is_shutdown():
+            r.sleep()
+            
+            if (self.raw_rss is not None) and (self.poses is not None):
+                self.traindata = ProcessedData(self.raw_rss,poses=self.poses,poses_type='Path')
+                #try:
+                eprint('Generating model')  
+                self.generate_model()
+                eprint('Model data, X: '+str(self.model.data['Y'].shape[0]),
+                       'APs: '+str(self.model.data['Y'].shape[1]))
+                #except:
+                #    eprint('No model')
+
+                        
+    #localization functions
+    #def format_data(self,raw_rss,**kwargs):
+    #    if (raw_rss is not None) and (poses is not None):
+    #        return ProcessedData(raw_rss,**kwargs)
+    #    else:
+    #        return None
+
+    def generate_model(self):
+        if self.traindata is not None:
+            self.model = WifiGP(self.traindata.data,all_mac_dict=self.traindata.all_mac_dict)
+            self.model.optimize()
+        else:
+            eprint('[WARN] Localization failed - No training data available for rss model')
+
+    def model_check(self,raw_rss):
+        #model existance and minimum APs
+        if self.model is None:
+            eprint('[WARN] No model available')
+            return None
+        if self.model.data['Y'].shape[1] == 0:
+            eprint('[WARN] Not enough training data for localization')
+            return None
+        
+        #model wrt req_rss
+        rss = self.format_data((raw_rss,),other_mac_dict=self.traindata.all_mac_dict,
+            filters_on=False)
+        if np.prod(rss.data['Y'].shape) == 0:
+            eprint('[WARN] No common APs between rss message and training data')
+            return None
+        non_zero_aps = np.sum([1 if np.sum(y)>0 else 0 for y in rss.data['Y'].T])
+        if non_zero_aps < 5:
+            eprint('[WARN] Not enough nonzeros APs ('+str(non_zero_aps)+'/5)')
+            return None
+        return rss
+    
+    def pose_from_array(self,array):
+        pose = Pose()
+        pose.position.x = array.flatten()[0]
+        pose.position.y = array.flatten()[1]
+        return pose
+
+    #Subscribers, call_backs and handles
+    def subscribers(self):
+        eprint('Subscribing to rss')
+        rospy.Subscriber(self.ns+'rss',RssData,self.callback_rss) 
+        
+        #TODO:Fix dependency on external node providing trajectory for now using hector_slam
+        eprint('Subscribing to trajectory')
+        rospy.Subscriber(self.ns+'trajectory',Path,self.callback_trajectory)
+
+    def callback_rss(self,new_rss):
+        self.raw_rss.append(new_rss)
+
+    def callback_trajectory(self,trajectory):
+        self.poses = [pose for pose in trajectory.poses]
+
+    def handle_loc(self,req):
+        #try:
+        loc = loc_server_handle(self.model,req.rss,req.nsamples,req.pose_array,ns=self.ns)
+        #except:
+        #    e = sys.exc_info()[0]
+        #    eprint('[ERROR] Localization failed: '+str(e))  
+        #    return None
+        
+        loc[0].header.frame_id = self.ns+'map'
+        loc[0].header.seq = self.seq 
+        self.seq += 1
+
+        return loc
+
+if __name__ == '__main__':
+    rss_loc = RssLocalization()
+
+#PROBLEM WITH TF SHOULD GET THE ROSCLOCK FROM POSE? HAVE TO CHANGE RSSDATA FORMAT IS BECOMING A PROBLEM NOT TO SAVE HEADER WITH TIME
+
+
+    

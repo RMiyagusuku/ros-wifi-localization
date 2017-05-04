@@ -1,0 +1,120 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+import time
+from datetime import datetime
+import distutils.dir_util
+#ros libraries
+import rospy
+#ros messages
+from std_msgs.msg import Float64MultiArray
+from geometry_msgs.msg import Pose, PoseStamped, PoseWithCovarianceStamped
+from rss.msg import RssData
+#ros services
+from rss.srv import Localization
+#personal libraries
+from rss.localization_server import loc_server_client
+from Localization.motionmodel.odometry import Odometry as OdomModel
+
+debug=0
+verbose=1
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+class Save():
+    def __init__(self):
+        rospy.init_node('save',anonymous=True)  #ROS node init        
+
+        #ROS PARAMSERVER
+        self.ns = rospy.get_namespace()
+        filepath = rospy.get_param('~filepath',
+                                          '/home/renato/catkin_ws/src/rss/test results')        
+
+        angle_var       = rospy.get_param('~angle_var',0.01)
+        distance_var    = rospy.get_param('~distance_var',0.02)
+        rss_interval    = rospy.get_param('~rss_interval',4)
+        min_particles   = rospy.get_param('~min_particles',1500)
+        max_particles   = rospy.get_param('~max_particles',5000)
+        joint_pgPoE     = rospy.get_param('~joint_pgPoE',0)
+        joint_sgPoE     = rospy.get_param('~joint_sgPoE',0)
+
+        if joint_pgPoE*joint_sgPoE:
+            joint = 'agPoE'
+        else:
+            if joint_pgPoE:
+                joint = 'pgPoE'
+            elif joint_sgPoE:
+                joint = 'sgPoE'
+            else:
+                joint = 'gPoE'
+
+        self.model_name = rospy.get_param('~model_name','hybrid') 
+        self.bag_name   = rospy.get_param('~bag_name','b3test1') 
+        
+        self.mcl_dict = {'angle_var':angle_var, 'distance_var':distance_var, 'rss_interval':rss_interval, 'model_name':self.model_name, 'bag_name':self.bag_name, 'min_particles':min_particles, 'max_particles':max_particles, 'joint':joint}
+
+        self.filepath = filepath+'/'+joint+'/'+self.bag_name+'/'+self.model_name
+        eprint('Save in folder: ',self.filepath)
+        #create filepath directory if it does not exist
+        distutils.dir_util.mkpath(self.filepath)
+
+
+        #subscribing topics
+        wifi_pose_topic = rospy.get_param('~wifi_pose_topic',self.ns+'mcl_pose_weighted')
+        lrf_pose_topic  = rospy.get_param('~lrf_pose_topic',self.ns+'amcl_pose')
+
+        #PRIVATE PARAMS
+        base_interval  = 1
+        self.wifi_poses = list()
+        self.lrf_poses = list()
+        
+        #subscribers
+        eprint('Subscribing to '+lrf_pose_topic) #listens to rss messages
+        rospy.Subscriber(wifi_pose_topic,PoseStamped,self.callback_wifi_pose) 
+        eprint('Subscribing to '+wifi_pose_topic) #listens to rss messages
+        rospy.Subscriber(lrf_pose_topic,PoseWithCovarianceStamped,self.callback_lrf_pose) 
+        
+
+        #Self localization at rate 1
+        shutdown = False 
+        while (not rospy.is_shutdown()) and (not shutdown):
+            time.sleep(10) #check every 10s 
+            topics = rospy.get_published_topics()
+            #outputs 1 if rss is being published, 0 otherwise
+            active = sum([1 if 'rss' in t[0] else 0 for t in topics]) 
+            if not active:
+                eprint("Shutdown routine")
+                while not shutdown:                
+                    shutdown = self.save_and_shutdown()
+                    time.sleep(1)
+                rospy.signal_shutdown("Shutdown")
+               
+
+    def callback_wifi_pose(self,pose):
+        self.wifi_poses.append(pose)
+
+    def callback_lrf_pose(self,pose):
+        self.lrf_poses.append(pose)
+
+    def save_and_shutdown(self):
+        try:        
+            try: 
+                import cPickle as pickle
+            except ImportError:
+                import pickle
+
+            filename = self.filepath+'/test'+str(datetime.now())+'.p'        
+            d = {'wifi':self.wifi_poses, 'lrf':self.lrf_poses, 'mcl':self.mcl_dict}
+
+            with open(filename, 'wb+') as f:
+                pickle.dump(d,f,2)
+            
+            return True
+        except:
+            return False
+
+if __name__ == '__main__':
+    save = Save()

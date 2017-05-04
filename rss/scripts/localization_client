@@ -1,0 +1,73 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+
+#ROS libraries
+import rospy
+import tf
+
+#ros messages
+from geometry_msgs.msg import Pose, PoseArray
+from rss.msg import RssData
+
+#ros service
+from rss.srv import Localization
+
+#personal libraries
+from ROS.classes import Measurement
+from ROS.classes import ProcessedData
+from ROS.load import load
+
+from Localization.sensormodel.gp import GP
+from util.others import mesh
+
+#
+import cPickle as pickle
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+class LocalizationClient():
+    def __init__(self):
+        rospy.init_node('localization_client',anonymous=True)  #ROS node init        
+        self.ns = rospy.get_namespace()
+        self.rss = None
+        self.nsamples = 500
+
+        #subscribers 
+        eprint('Subscribing to '+self.ns+'rss') #listens to r0 rss messages
+        rospy.Subscriber(self.ns+'rss',RssData,self.callback_rss) 
+        
+        self.pub = rospy.Publisher('srv_samples',PoseArray,queue_size=1)        
+      
+        r = rospy.Rate(0.25) #every 4s
+        while not rospy.is_shutdown():
+            r.sleep()
+            self.localization_client()
+            
+    #Service
+    def localization_client(self):
+        srv_name = self.ns+'loc_server'
+        rospy.wait_for_service(srv_name)
+        
+        if self.rss is not None:
+            try:
+                localization_request = rospy.ServiceProxy(srv_name, Localization)
+                lresponse = localization_request(self.rss,self.nsamples) 
+            
+                eprint('pX: \t'+str(lresponse.p_pose))
+                eprint(str(len(lresponse.pose_array.poses))+' samples received')
+                self.pub.publish(lresponse.pose_array)
+
+            except rospy.ServiceException, e:
+                eprint('[WARN] Request failed: %s'%e)
+
+    #Subscribers and call_backs
+    def callback_rss(self,rss):
+        self.rss = rss
+
+if __name__ == '__main__':
+    locClient = LocalizationClient()
+

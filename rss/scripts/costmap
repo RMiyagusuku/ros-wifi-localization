@@ -1,0 +1,101 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#ros libraries
+import sys
+import roslib; roslib.load_manifest('visualization_marker_tutorials')
+
+from std_msgs.msg import Float64MultiArray
+from visualization_msgs.msg import Marker
+from visualization_msgs.msg import MarkerArray
+from rss.msg import ProbArray
+
+import rospy
+#standard libraries
+import numpy as np
+
+debug = 1
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+class CostMap():
+    def __init__(self):
+        rospy.init_node('costmap')
+        limits = None
+
+        subs_topic_id = rospy.get_param('~subs_topic_id','self_pose_array')
+        map_limits = rospy.get_param('~map_limits','map_limits')
+        
+        if debug:
+            eprint('Map limits: '+str(map_limits))
+            eprint('Topic id : '+str(subs_topic_id))
+
+        while(limits is None):
+            try:
+                limits = rospy.get_param(map_limits)
+            except:
+                eprint('Waiting for map_limits on the parameter server')
+                rospy.sleep(1)
+        
+    
+        x_min = limits['x_min']
+        x_max = limits['x_max']
+        y_min = limits['y_min']
+        y_max = limits['y_max']
+        spn   = limits['spn']
+
+
+        if debug:
+            eprint('Map limits: '+str(limits))
+
+        x_vec = np.linspace(x_min,x_max,spn)
+        y_vec = np.linspace(y_min,y_max,spn)
+
+        #init
+        self.markerArray = MarkerArray()
+        i = 0
+        for y in y_vec:
+            for x in x_vec:
+                marker = Marker()
+                marker.id = i            
+                marker.header.frame_id = "map"
+                marker.type = marker.CUBE
+                marker.action = marker.ADD
+                marker.scale.x = 2
+                marker.scale.y = 2
+                marker.scale.z = 0.5
+                marker.color.a = 1
+
+                marker.color.r = 0.0
+                marker.color.g = 0.0
+                marker.color.b = 0.0
+
+                marker.pose.orientation.w = 1.0
+                marker.pose.position.x = x
+                marker.pose.position.y = y 
+                marker.pose.position.z = -5 
+            
+                self.markerArray.markers.append(marker)
+                i += 1 
+
+        eprint('Subscribing to '+subs_topic_id)
+        rospy.Subscriber(subs_topic_id,Float64MultiArray,self.callback_cost_map) 
+
+        self.publisher = rospy.Publisher('costmap',MarkerArray,queue_size=1)        
+
+
+        while not rospy.is_shutdown():
+            rospy.sleep(0.25)
+
+
+    def callback_cost_map(self,mesh_prob):
+        for i,p in enumerate(mesh_prob.data):
+            self.markerArray.markers[i].color.r = np.clip(p*1.,0,1)
+
+        #publish new cost map
+        self.publisher.publish(self.markerArray)
+
+if __name__ == '__main__':
+    costmap = CostMap()
+
+

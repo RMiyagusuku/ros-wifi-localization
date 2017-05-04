@@ -1,0 +1,34 @@
+<launch>
+
+    <param name="use_sim_time" value="true" />
+    <arg name="bag_path"  default="$(find tests)/bags/"/>
+    <arg name="bag_name"  default="b3test1"/>   
+    <arg name="rosbag_rate"  default="1" />
+
+    <!-- Playback rosbag -->
+    <node name="player" pkg="rosbag" type="play" output="screen" args="--clock --rate=$(arg rosbag_rate) $(arg bag_path)$(arg bag_name).bag"/>
+
+    <!-- TF between the robot and the laser base -->
+    <node  name="tf_static" pkg="tf" type="static_transform_publisher" args="0.08 0 0 0 0 0 /base_link /laser 1" />
+
+    <!-- Processing nodes -->
+    <node name="slam" pkg="gmapping" type="slam_gmapping" output="screen" launch-prefix="xterm -e">
+      <param name="particles" value="60" />
+      <param name="resampleThreshold" value="0.75"/>
+    </node> 
+
+    <node name="trajectory_server" pkg="hector_trajectory_server" type="hector_trajectory_server" output="screen">
+      <param name="target_frame_name" type="string" value="/map" />
+      <param name="source_frame_name" type="string" value="/base_link" />
+      <param name="trajectory_update_rate" type="double" value="10" />
+      <param name="trajectory_publish_rate" type="double" value="1" />
+    </node>
+
+    <node name="rss_loc" pkg="rss" type="localization" output="screen" launch-prefix="xterm -e">
+    </node>
+    
+    <!-- Viewers -->
+    <node name="rviz" pkg="rviz" type="rviz"  args="-d /home/renato/catkin_ws/src/tests/launch/testconfig.rviz"/>
+  
+</launch>
+
