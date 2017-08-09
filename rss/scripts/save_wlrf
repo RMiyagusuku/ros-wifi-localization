@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys
+import numpy as np
+import time
+from datetime import datetime
+import distutils.dir_util
+#ros libraries
+import rospy
+#ros messages
+from geometry_msgs.msg import PoseArray, PoseWithCovarianceStamped
+from amcl.msg import ParticlesStats
+from rss.msg import RssData
+
+
+debug=0
+verbose=1
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+class Save():
+    def __init__(self):
+        rospy.init_node('save',anonymous=True)  #ROS node init        
+
+        #ROS PARAMSERVER
+        self.ns = rospy.get_namespace()
+        self.all_params = dict()
+
+        names = rospy.get_param_names()
+        for param_name in names:
+            param = rospy.get_param(param_name)
+            self.all_params[param_name]=param
+            eprint(param_name,param)
+
+
+        self.filepath = self.all_params['/save/filepath']+'/'+self.all_params['/player/bag_name']
+        eprint('Save in folder: ',self.filepath)
+        #create filepath directory if it does not exist
+        distutils.dir_util.mkpath(self.filepath)
+
+        #lists
+        self.particlecloud = list()
+        self.amclpose = list()
+        self.particlesstats = list()
+        self.wifistats = list()
+
+        #subscribers
+        rospy.Subscriber('/particlecloud',PoseArray,self.callback_particlecloud) 
+        rospy.Subscriber('/amcl_pose',PoseWithCovarianceStamped,self.callback_amclpose) 
+        rospy.Subscriber('/particleweightsstats',ParticlesStats,self.callback_particlesstats)
+        rospy.Subscriber('/wifiweightsstats',ParticlesStats,self.callback_wifistats)
+
+        shutdown = False 
+        while (not rospy.is_shutdown()) and (not shutdown):
+            time.sleep(10) #check every 10s 
+            topics = rospy.get_published_topics()
+            #outputs 1 if rss is being published, 0 otherwise
+            active = sum([1 if 'rss' in t[0] else 0 for t in topics]) 
+            if not active:
+                eprint("Shutdown routine")
+                while not shutdown:                
+                    shutdown = self.save_and_shutdown()
+                    time.sleep(1)
+                rospy.signal_shutdown("Shutdown")
+               
+    #callbacks
+    def callback_particlecloud(self,msg):
+        self.particlecloud.append(msg)
+    def callback_amclpose(self,msg):
+        self.amclpose.append(msg)
+    def callback_particlesstats(self,msg):
+        self.particlesstats.append(msg)
+    def callback_wifistats(self,msg):
+        self.wifistats.append(msg)
+
+    def save_and_shutdown(self):
+        try:        
+            try: 
+                import cPickle as pickle
+            except ImportError:
+                import pickle
+
+            filename = self.filepath+'/'+str(datetime.now())  
+            #save params and topics separately
+            fparams = filename+' params.p'
+            with open(fparams, 'wb+') as f:
+                pickle.dump(self.all_params,f,2)
+
+            ftopics = filename+' topics1.p'
+            d = {'amclpose':self.amclpose,
+                 'particlesstats':self.particlesstats,
+                 'wifistats':self.wifistats}
+            with open(ftopics, 'wb+') as f:
+                pickle.dump(d,f,2)
+            #particlecloud is separated from other topics due to its volume
+            ftopics = filename+' topics2.p'
+            d = {'particlecloud':self.particlecloud}
+            with open(ftopics, 'wb+') as f:
+                pickle.dump(d,f,2)
+
+            return True
+        except:
+            return False
+
+if __name__ == '__main__':
+    save = Save()

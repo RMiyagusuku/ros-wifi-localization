@@ -1,0 +1,122 @@
+<launch>
+
+    <param name="use_sim_time"   value="true" />
+
+    <arg name="visualization"    default="true" />
+    <arg name="rosbag_rate"      default="1" />
+    <arg name="angle_var"        default="0.08"/>
+    <arg name="distance_var"     default="0.05"/>
+    <arg name="rss_interval"     default="3" />
+
+    <arg name="model_name"       default="gaussian" />
+    <arg name="model_likelihood" default="PoE" />
+
+    <arg name="likelihood_metric_fun"  default="entropy_difference" />
+    <arg name="likelihood_fixed_alpha" default="true" />
+    <!--
+    <arg name="likelihood_eta"  default="/home/renato/Desktop/b3map_xopt_with_correlation2.p" />
+    <arg name="likelihood_CORR" default="/home/renato/Desktop/b3map_CORR2.p" />
+    -->
+
+    <!-- amcl parameters -->
+    <arg name="update_min_d"        default="0.30" />
+    <arg name="recovery_alpha_fast" default="0.1" />
+    <arg name="recovery_alpha_slow" default="0.001" />
+    <arg name="odom_model_type"     default="diff-corrected"/>
+    <arg name="odom_alpha1"         default="0.005"/>
+    <arg name="odom_alpha2"         default="0.005"/>
+    <arg name="odom_alpha3"         default="0.010"/>
+    <arg name="odom_alpha4"         default="0.005"/>
+
+    <!-- wifi parameters -->
+    <arg name="min_particles"    default="100" />
+    <arg name="max_particles"    default="5000" />
+
+    <arg name="bag_path"         default="$(find tests)/bags/krp/"/>
+    <arg name="map_path"         default="$(find tests)/maps/"/>
+    <arg name="bag_name"         default="b3test1"/>   
+    <arg name="map_name"         default="b3map"/> 
+    <arg name="use_lrfmap"       default="False"/> 
+    
+    <arg name="train_data_name"  default="b3test1"/> 
+    <arg name="train_data_fuse"  default="10"/>
+    <arg name="save_filepath"    default="/home/renato/Desktop/test results/wlrf"/> 
+
+    <arg name="global_localization" default="True"/>
+
+    <!-- map limits 
+    TODO: get infor from the map server
+    b3map limit
+    -->   
+    <arg name="map_xmin"         default="-25" /> 
+    <arg name="map_xmax"         default="55"  /> 
+    <arg name="map_ymin"         default="-60" /> 
+    <arg name="map_ymax"         default="20"  /> 
+    <arg name="map_spn"          default="50"  /> 
+
+
+    <!-- Playback rosbag -->
+    <node name="player" pkg="rosbag" type="play" args="--clock --rate=$(arg rosbag_rate) $(arg bag_path)$(arg bag_name).bag">
+        <param name="bag_name" value="$(arg bag_name)"/>
+    </node>
+
+    <!-- TF between the robot and the laser base -->
+    <node  name="tf_static" pkg="tf" type="static_transform_publisher" args="0.08 0 0 0 0 0 /base_link /laser 1" />
+
+    <!-- Processing nodes -->
+    <node name="map_server" pkg="map_server" type="map_server" args="$(arg map_path)$(arg map_name).yaml" />
+
+    <node name="amcl" pkg="amcl" type="amcl">
+        <param name="update_min_d"          value="$(arg update_min_d)"/>
+        <param name="recovery_alpha_slow"   value="$(arg recovery_alpha_slow)"/>
+        <param name="recovery_alpha_fast"   value="$(arg recovery_alpha_fast)"/>
+        <param name="odom_model_type"       value="$(arg odom_model_type)"/>
+        <param name="odom_alpha1"           value="$(arg odom_alpha1)"/>
+        <param name="odom_alpha2"           value="$(arg odom_alpha2)"/>
+        <param name="odom_alpha3"           value="$(arg odom_alpha3)"/>
+        <param name="odom_alpha4"           value="$(arg odom_alpha4)"/>
+        <param name="max_particles"         value="$(arg max_particles)"/>
+        <param name="min_particles"         value="$(arg min_particles)"/>
+    </node>
+
+    <node name="rss_loc_server" pkg="rss" type="localization">
+        <param name="model_name"        value="$(arg model_name)" />
+        <param name="model_likelihood"  value="$(arg model_likelihood)" />
+        <param name="likelihood_metric_fun"  value="$(arg likelihood_metric_fun)" />
+        <param name="likelihood_fixed_alpha" value="$(arg likelihood_fixed_alpha)" />
+        <param name="train_data_name"   value="$(arg train_data_name)" />
+        <param name="train_data_fuse"   value="$(arg train_data_fuse)" />
+        <param name="map_xmin"          value="$(arg map_xmin)" />
+        <param name="map_xmax"          value="$(arg map_xmax)" />
+        <param name="map_ymin"          value="$(arg map_ymin)" />
+        <param name="map_ymax"          value="$(arg map_ymax)" />
+        <param name="map_spn"           value="$(arg map_spn)" />
+        <param name="use_lrfmap"     value="$(arg use_lrfmap)"/>
+        <param name="map_name"       value="$(arg map_name)"/>
+        <param name="map_path"       value="$(arg map_path)"/>
+    </node>
+
+    <node name="wlrf" pkg="rss" type="wlrf" respawn="true">
+        <param name="global_localization" value="$(arg global_localization)"/>
+        <param name="max_particles"         value="$(arg max_particles)"/>
+    </node>
+
+    <!--global localization-->
+    <group if="$(arg global_localization)">
+        <node pkg="rosservice" type="rosservice" name="global_loc" args="call --wait /global_localization"/> 
+    </group>
+
+    
+    <!-- Viewers -->
+    <group if="$(arg visualization)">
+        <node name="rviz" pkg="rviz" type="rviz"  args="-d $(find rss)/launch/wlrf.rviz"/>
+    </group>
+
+    <node name="save" pkg="rss" type="save_wlrf" required = "true" output="screen" > 
+        <param name="filepath"          value="$(arg save_filepath)" />
+    </node>
+
+</launch>
+
+
+

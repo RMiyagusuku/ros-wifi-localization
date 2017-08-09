@@ -1,0 +1,214 @@
+#!/usr/bin/env python
+from __future__ import print_function
+#standard libraries
+import sys, time
+import numpy as np
+#ros libraries
+import rospy
+import tf
+#ros messages
+from std_msgs.msg import Float64MultiArray, Int32
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped
+from rss.msg import RssData
+from amcl.msg import ParticlesStats
+#ros services
+from rss.srv import Localization
+#personal libraries
+from rss.localization_server import loc_server_client
+
+import copy
+
+debug=0
+verbose=0
+random_init=0
+max_rss_len = 3
+min_rss_len = 3
+
+def eprint(*args, **kwargs):                    #prints errors/warnings to stderr
+    print(*args, file=sys.stderr, **kwargs)
+
+def posefromarray(array):
+    pose = Pose()
+    pose.position.x = array[0]
+    pose.position.y = array[1]
+    quat = tf.transformations.quaternion_from_euler(0,0,array[2]) 
+    pose.orientation.z = quat[2]
+    pose.orientation.w = quat[3]
+    return pose
+
+def arrayfrompose(pose_array):
+    tmp = [[p.position.x, p.position.y,tf.transformations.euler_from_quaternion(
+            (0.,0.,p.orientation.z,p.orientation.w))[2]] for p in pose_array.poses] 
+    return np.asarray(tmp)
+
+class WLRF():
+    def __init__(self):
+        rospy.init_node('wlrf_model',anonymous=True)  #ROS node init        
+
+        #ROS PARAMSERVER
+        self.ns = rospy.get_namespace()
+        
+        #frames
+        self.global_frame_id = rospy.get_param('~global_frame_id','map')
+        self.odom_frame_id   = rospy.get_param('~odom_frame_id','odom')
+        self.robot_frame_id  = rospy.get_param('~robot_frame_id','base_link')
+        
+        self.global_localization = rospy.get_param('~global_localization',True)
+        self.max_particles = rospy.get_param('~max_particles',5000)
+
+        #subscribing topics
+        rss_topic  = rospy.get_param('rss_topic',self.ns+'rss')
+        
+        #publishing topics
+        best_topic          = rospy.get_param('pose_best_topic', self.ns+'mcl_pose_best')        
+        weighted_topic      = rospy.get_param('pose_weighted_avg_topic',
+                                                             self.ns+'mcl_pose_weighted')        
+        pose_topic          = rospy.get_param('posearray_topic','amcl_setposearray')
+        prob_mesh_topic     = rospy.get_param('prob_mesh_topic',self.ns+'mcl_sensor_update_prob')
+        
+        #services
+        self.loc_srv_ns = rospy.get_param('loc_srv_ns',self.ns)
+
+        #PRIVATE PARAMS
+        self.tf_listener = tf.TransformListener()
+        self.raw_rss = list()
+
+        self.particles = None
+        self.particles_weights = None
+        self.particles_time = rospy.get_rostime()
+        self.seq = 0
+
+
+        #subscribers 
+        eprint('Subscribing to '+rss_topic) #listens to rss messages
+        rospy.Subscriber(rss_topic,RssData,self.callback_rss) 
+        rospy.Subscriber('particlecloud',PoseArray,self.callback_posearray)
+        rospy.Subscriber('wifi_init',Int32,self.callback_wifiinit)
+        
+        #publishers
+        eprint('Publishing to '+prob_mesh_topic)
+        self.pub_probmesh  = rospy.Publisher(prob_mesh_topic,Float64MultiArray,queue_size=1) 
+        eprint('Publishing to '+pose_topic)
+        self.pub_posearray = rospy.Publisher(pose_topic,PoseArray,queue_size=1) 
+        eprint('Publishing to '+weighted_topic)
+        self.pub_poseweighted = rospy.Publisher(weighted_topic,PoseStamped,queue_size=1) 
+        eprint('Publishing to wifiweightsstats')
+        self.pub_wifistats = rospy.Publisher('/wifiweightsstats',ParticlesStats,queue_size=1) 
+
+
+        if not self.global_localization:
+            nparticles = Int32()
+            nparticles.data = self.max_particles
+            self.callback_wifiinit(nparticles)
+
+        #MAIN LOOP
+        r = rospy.Rate(1)
+        counter = 0
+        while not rospy.is_shutdown():
+            counter += 1
+            r.sleep() #base_interval
+
+    def callback_rss(self,rss):
+        if len(self.raw_rss) >= max_rss_len:
+            self.raw_rss.pop(0) #remove oldest rss
+        self.raw_rss.append(rss)
+
+
+    def callback_posearray(self,posearray):
+        try_ = 0        
+        w_ = False
+        time_stamp = posearray.header.stamp
+        while ((try_<3) and (not w_)):
+            rss_copy = copy.copy(self.raw_rss)
+            w_ = self.wifiweight(posearray,rss_copy,time_stamp)
+            try_ += 1
+
+    def wifiweight(self,posearray,rss_copy,time_stamp):
+        if len(rss_copy)<min_rss_len: #ensure at least min_rss+len samples have been obtained
+            time.sleep(.5)
+            return False
+            
+        loc = loc_server_client(rss_copy,len(posearray.poses),pose_array=posearray,ns=self.loc_srv_ns) 
+
+        if loc is None:
+            eprint('[WARN] Error obtaining particles weights')
+            return False
+
+        if debug:
+            eprint("Localization received")
+
+        weights = np.asarray(loc.weights)
+        self.publish_wifiweightsstats(weights,time_stamp)
+        #eprint('max weights\t',np.max(weights))
+        #eprint('avg weights\t',np.mean(weights))
+        #eprint('std weights\t',np.std(weights))
+        return True
+
+
+    def callback_wifiinit(self,nparticles):
+        nsamples = int(nparticles.data)
+        init = False     
+        t0 = time.time()   
+        while (not init):
+            eprint('Wifi initialization in progress')
+            rss = copy.copy(self.raw_rss)
+            init = self.wifiinit(nsamples,rss)
+        eprint('initilization finished')
+        eprint('elapsed time {:} ms'.format(int((time.time()-t0)*1000)))
+        self.publish_pose()
+
+    def wifiinit(self,nparticles,rss_copy):
+        #sample wifi model for particles
+        if len(rss_copy)<min_rss_len: #ensure at least min_rss+len samples have been obtained
+            time.sleep(.5)
+            return False    
+        
+        if debug:
+            eprint('Updating particles based on '+str(len(rss_copy))+' sensor readings')
+        
+        #try:
+        #get the likelihood of each particle in self.pose_array        
+        loc = loc_server_client(rss_copy,nparticles,ns=self.loc_srv_ns) 
+        if loc is None:
+            eprint('[WARN] Bootstraping particles failed')
+            return False
+
+        if debug:
+            eprint("Localization received")
+        #for visualizing the prob of the samples sent        
+        #pose_prob = Float64MultiArray()
+        #pose_prob.data = loc.prob_mesh
+    
+        self.particles = arrayfrompose(loc.pose_array)
+        #eprint(self.particles)
+
+        #all sampled particles have orientation zero
+        #randomize theta
+        self.particles[:,2] = 2*np.pi*np.random.rand(nparticles)-np.pi
+        self.particles_weights = np.ones(nparticles) 
+        return True
+
+
+    def publish_pose(self):
+        #particles pose
+        tmp_pose_array = PoseArray()        
+        tmp_pose_array.header.seq = self.seq
+        self.seq += 1
+        tmp_pose_array.header.frame_id  = self.global_frame_id        
+        tmp_pose_array.header.stamp     = self.particles_time        
+        tmp_pose_array.poses    = [posefromarray(x) for x in self.particles]
+        self.pose_array         = tmp_pose_array
+        self.pub_posearray.publish(self.pose_array)
+
+    def publish_wifiweightsstats(self,weights,time_stamp):
+        pstats = ParticlesStats()
+        pstats.header.stamp = time_stamp
+        pstats.w_std = np.std(weights)
+        pstats.w_avg = np.mean(weights)
+        pstats.w_max = np.max(weights)
+        self.pub_wifistats.publish(pstats)
+
+if __name__ == '__main__':
+    wlrf = WLRF()
+
+
