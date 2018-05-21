@@ -1,17 +1,20 @@
 from Localization.sensormodel.hybrid import hGP
 from Localization.sensormodel.gp import GP
+import os
 
 def load_data(**kwargs):
     """
     Load a previously pickled data from file_path/file_name.
     Optional Parameters [default]
         file_name ['b3test1']: Core name of the files to get data from -> <file_name>rss.p and <file_name>poses.p
-        file_path ['/home/renato/catkin_ws/src/tests/bags/processed_data/']: Path where to find files   
+        file_path ['~/catkin_ws/src/tests/bags/processed_data/']: Path where to find files   
     """
 
     file_name = kwargs.get('file_name','b3test1')
     #TODO:change file path
-    file_path = kwargs.get('file_path','/home/renato/catkin_ws/src/tests/bags/processed_data/')
+    file_path = kwargs.get('file_path',None)
+    if file_path is None:
+        file_path=os.path.expanduser('~')+'/catkin_ws/src/tests/bags/processed_data/'
     
     f=file_path+file_name
 
@@ -39,12 +42,14 @@ def load_model(**kwargs):
     Load a previously pickled data from file_path/file_name.
     Optional Parameters [default]
         file_name ['b3test1']: Core name of the files to get data from -> <file_name>rss.p and <file_name>poses.p
-        file_path ['/home/renato/catkin_ws/src/tests/bags/processed_data/']: Path where to find files   
+        file_path ['~/catkin_ws/src/tests/bags/processed_data/']: Path where to find files   
     """
 
     file_name = kwargs.get('file_name','b3_hgp')
-    file_path = kwargs.get('file_path','/home/renato/catkin_ws/src/tests/bags/processed_data/')
-    
+    file_path = kwargs.get('file_path',None)
+    if file_path is None:
+        file_path=os.path.expanduser('~')+'/catkin_ws/src/tests/bags/processed_data/'
+
     f=file_path+file_name+'.p'
 
     # Load model

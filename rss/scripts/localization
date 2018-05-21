@@ -26,8 +26,6 @@ from rss.load import load_data, load_model
 
 from Localization.sensormodel.gp import GP
 from Localization.sensormodel.hybrid import hGP
-#from Localization.sensormodel.poe_likelihood import PoE_Gaussian
-from Localization.sensormodel.moe_likelihood import MoE_Gaussian as PoE_Gaussian
 
 
 from util.others import mesh
@@ -44,14 +42,8 @@ class RssLocalization():
         rospy.init_node('rss_localization',anonymous=True)  #ROS node init        
         self.ns = rospy.get_namespace()
         model_name      = rospy.get_param('~model_name','hybrid') 
-        likelihood_eta  = rospy.get_param('~likelihood_eta',False) 
-        likelihood_CORR = rospy.get_param('~likelihood_CORR',None) 
         train_data_name = rospy.get_param('~train_data_name','b3test1')
         train_data_fuse = rospy.get_param('~train_data_fuse',10)
-        #joint likelihood kwargs
-        kl_flag         = bool(rospy.get_param('~joint_kl',0))
-        gPoEsign        = bool(rospy.get_param('~joint_sgPoE',0))
-
 
         #map limits 
         self.x_min      = rospy.get_param('~map_xmin',-25)
@@ -99,7 +91,7 @@ class RssLocalization():
             # Load model
             data_empty = {'X':np.asarray([[1,1]]),'Y':np.asarray([1]),'Var':np.asarray([1])}
             self.model = WifiGP(data_empty,verbose=True)
-            self.model.load(filepath='/home/renato/catkin_ws/src/tests/bags/processed_data/b3_hgp.p')
+            self.model.load(filepath='~/catkin_ws/src/tests/bags/processed_data/b3_hgp.p')
 
         else:
             file_name = train_data_name  
@@ -119,24 +111,8 @@ class RssLocalization():
             #Train model
             eprint('Training model')
             self.model = WifiGP(traindata.data,all_mac_dict=traindata.all_mac_dict)
-            if kl_flag:
-                self.model.likelihood = PoE_Gaussian(kl_flag=kl_flag,gPoEsign=gPoEsign)
-
-
             self.model.optimize()
             eprint('Model trained successfully')
-
-            if likelihood_eta is not False:
-                eprint('trying to load eta')
-                eta = pickle.load(open(likelihood_eta,"rb"))
-                eprint(eta)
-                eprint('trying to load CORR')
-                CORR = pickle.load(open(likelihood_CORR,"rb"))
-                eprint(CORR)
-                self.model.likelihood.use_gate_corr = True
-                self.model.likelihood.CORR = CORR
-                self.model.likelihood.eta = eta
-        
     
         self.loc_server = rospy.Service(self.ns+'loc_server', Localization, self.handle_loc)
 
@@ -189,15 +165,18 @@ class RssLocalization():
 
         except:
             e = sys.exc_info()[0]
-            eprint('[ERROR] Localization failed: '+str(e))  
+            rospy.logerr('[self_loc] Localization failed: '+str(e))  
             return False
     
     def handle_loc(self,req):
         try:
             loc = loc_server_handle(self.model,req.rss,req.nsamples,req.pose_array,ns=self.ns)
+            if loc is None: 
+                rospy.logerr('[handle_loc] Loc returned None')
+                return None
         except:
             e = sys.exc_info()[0]
-            eprint('[ERROR] Localization failed: '+str(e))  
+            rospy.logerr('[handle_loc] Localization failed: '+str(e))  
             return None
 
         loc[0].header.frame_id = self.ns+'map'
@@ -208,7 +187,3 @@ class RssLocalization():
 
 if __name__ == '__main__':
     rss_loc = RssLocalization()
-
-
-
-    

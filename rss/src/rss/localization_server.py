@@ -88,7 +88,7 @@ def loc_server_handle(model,raw_rss,nsamples,pose_array, **kwargs):
     temp_x  = np.linspace(x_min,x_max,spn)
     temp_y  = np.linspace(y_min,y_max,spn)
     Xtest   = mesh(temp_x,temp_y)
-    prob_mesh = model.jointpdf(Xtest,rss.data['Y'],rss.data['Var'])
+    prob_mesh = model.jointpdf(Xtest,rss.data['Y'])
     
     if debug:
         eprint('Request')
@@ -122,7 +122,7 @@ def loc_server_handle(model,raw_rss,nsamples,pose_array, **kwargs):
         pose_array.poses = list()
 
         try:
-            measurement = (rss.data['Y'],rss.data['Var'])
+            measurement = rss.data['Y']
             samples     = model.sample(measurement,span=(x_min,x_max,y_min,y_max),
                             nsamples=nsamples,K=50,batch=1)#,alpha=alpha[0])
             pose_array.poses = [pose_from_array(x) for x in samples]
@@ -139,7 +139,7 @@ def loc_server_handle(model,raw_rss,nsamples,pose_array, **kwargs):
         samples = np.asarray(samples)
     
     # compute the weights as the likelihood of the samples
-    weights = model.jointpdf(samples,rss.data['Y'],rss.data['Var'])
+    weights = model.jointpdf(samples,rss.data['Y'])
     weights.tolist()
     prob_mesh.flatten().tolist()
 

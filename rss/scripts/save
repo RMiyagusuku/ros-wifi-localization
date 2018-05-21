@@ -31,7 +31,7 @@ class Save():
         #ROS PARAMSERVER
         self.ns = rospy.get_namespace()
         filepath = rospy.get_param('~filepath',
-                                          '/home/renato/catkin_ws/src/rss/test results')        
+                                          '~/Desktop/results')        
 
         angle_var       = rospy.get_param('~angle_var',0.01)
         distance_var    = rospy.get_param('~distance_var',0.02)

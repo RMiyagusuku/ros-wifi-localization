@@ -13,10 +13,6 @@
     <arg name="joint_sgPoE"     default="0" />
 
     <arg name="model_name"      default="gaussian" />
-    <!--
-    <arg name="likelihood_eta"  default="/home/renato/Desktop/b3map_xopt_with_correlation2.p" />
-    <arg name="likelihood_CORR" default="/home/renato/Desktop/b3map_CORR2.p" />
-    -->
     <arg name="min_particles"   default="1500" />
     <arg name="max_particles"   default="5000" />
 
@@ -26,7 +22,7 @@
     
     <arg name="train_data_name" default="b3test1"/> 
     <arg name="train_data_fuse" default="10"/>
-    <arg name="save_filepath"   default="/home/renato/Desktop/test results"/> 
+    <arg name="save_filepath"   default="~/Desktop/results"/> 
 
     <!-- map limits 
     TODO: get infor from the map server

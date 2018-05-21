@@ -150,7 +150,7 @@ class MCL():
         else:
             init = False
             trial = 0
-            while (not init) and (trial <= 10):    #try bootstraping 5 times
+            while (not init) and (trial <= 20):    #try bootstraping 20 times
                 init = self.init_particles() #bootstrap particles       
                 trial += 1
             if init:        
